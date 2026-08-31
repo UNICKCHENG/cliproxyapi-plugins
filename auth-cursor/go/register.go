@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"strconv"
 	"strings"
 	"sync/atomic"
 
@@ -14,6 +16,11 @@ import (
 // that omit the optimize_for parameter.
 const defaultOptimizeFor = "balanced"
 
+// maxCredentialWeight mirrors the ceiling the host enforces on credential weights. The
+// plugin cannot import the host's internal weight package, so the bound is repeated here to
+// reject a misconfigured value while the config is loading rather than at request time.
+const maxCredentialWeight = 1_000_000
+
 // pluginVersion is reported to the host and keys the sidecar bootstrap directory. Release
 // builds override it with -ldflags "-X main.pluginVersion=<release version>".
 var pluginVersion = "0.0.0-dev"
@@ -25,6 +32,27 @@ type pluginConfig struct {
 	SidecarPath string   `yaml:"sidecar-path"`
 	OptimizeFor string   `yaml:"optimize-for"`
 	Models      []string `yaml:"models"`
+	// Weights maps a credential, named by account email or auth file name, to its
+	// weighted-round-robin share. Weights live here instead of in the auth file because the
+	// login flow rewrites that file and would drop them on every renewal.
+	Weights map[string]credentialWeight `yaml:"weights"`
+}
+
+// credentialWeight is an integer weight decoded strictly. Decoding YAML into a plain int
+// truncates a fractional value, while the host rejects one outright, so the raw scalar is
+// parsed here to keep the plugin from accepting a weight the host would refuse.
+type credentialWeight int
+
+func (w *credentialWeight) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode {
+		return fmt.Errorf("weight must be an integer")
+	}
+	parsed, errParse := strconv.Atoi(strings.TrimSpace(node.Value))
+	if errParse != nil {
+		return fmt.Errorf("weight must be an integer, got %q", node.Value)
+	}
+	*w = credentialWeight(parsed)
+	return nil
 }
 
 type registration struct {
@@ -96,7 +124,42 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 		}
 	}
 	cfg.Models = models
+	weights, errWeights := normalizeWeights(cfg.Weights)
+	if errWeights != nil {
+		return pluginConfig{}, errWeights
+	}
+	cfg.Weights = weights
 	return cfg, nil
+}
+
+// normalizeWeights lowercases the credential keys so that lookups are case-insensitive and
+// rejects values the host would refuse, which would otherwise park the credential when the
+// synthesized auth reaches the scheduler. Non-positive weights are kept as zero, the value
+// the host reads as "exclude this credential from weighted routing".
+func normalizeWeights(weights map[string]credentialWeight) (map[string]credentialWeight, error) {
+	if len(weights) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]credentialWeight, len(weights))
+	seen := make(map[string]string, len(weights))
+	for rawKey, weight := range weights {
+		key := strings.ToLower(strings.TrimSpace(rawKey))
+		if key == "" {
+			return nil, fmt.Errorf("weights: credential key must not be empty")
+		}
+		if original, duplicated := seen[key]; duplicated {
+			return nil, fmt.Errorf("weights: %q and %q name the same credential", original, rawKey)
+		}
+		if weight > maxCredentialWeight {
+			return nil, fmt.Errorf("weights[%s]: weight must not exceed %d", rawKey, maxCredentialWeight)
+		}
+		if weight < 0 {
+			weight = 0
+		}
+		seen[key] = rawKey
+		out[key] = weight
+	}
+	return out, nil
 }
 
 func loadedConfig() pluginConfig {
@@ -135,6 +198,11 @@ func pluginRegistration() registration {
 					Name:        "models",
 					Type:        pluginapi.ConfigFieldTypeArray,
 					Description: "Fallback model ids used when Cursor.models.list() is unavailable for a credential.",
+				},
+				{
+					Name:        "weights",
+					Type:        pluginapi.ConfigFieldTypeObject,
+					Description: "Weighted-round-robin share per credential, keyed by account email or auth file name. Requires routing.strategy \"weighted-round-robin\".",
 				},
 			},
 		},

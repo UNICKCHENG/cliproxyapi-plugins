@@ -60,9 +60,16 @@ plugins:
       sidecar-path: ""
       optimize-for: "balanced"
       models: []
+      weights: {}         # per-credential share for weighted routing
 ```
 
 A full copy-paste example lives in [auth-cursor/config.example.yaml](auth-cursor/config.example.yaml).
+
+Two things worth knowing before you tune anything: renaming or hiding Cursor models uses the
+host-level `oauth-model-alias` / `oauth-excluded-models` blocks under the provider key
+`cursor`, and giving one account a larger share of traffic uses `weights` above together with
+`routing.strategy: weighted-round-robin`. Both are covered in
+[auth-cursor/README.md](auth-cursor/README.md#load-balancing).
 
 **2. Confirm the source is readable**
 
@@ -118,8 +125,9 @@ when the service PATH does not expose it.
 ```
 
 This mints a user API key and writes `cursor-<account>.json` into `auth-dir`, then exits
-without starting the server. See [auth-cursor/README.md](auth-cursor/README.md#credentials)
-for dashboard keys and expiry behaviour.
+without starting the server. Re-running it later renews the key and keeps the settings you
+added to that file. See [auth-cursor/README.md](auth-cursor/README.md#credentials) for
+dashboard keys and expiry behaviour.
 
 **7. Start the server and verify**
 

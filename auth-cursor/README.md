@@ -60,6 +60,8 @@ plugins:
       optimize-for: "balanced"
       # Fallback model ids used only when Cursor.models.list() is unavailable.
       models: []
+      # Per-credential share for weighted-round-robin routing. See "Load balancing".
+      weights: {}
 ```
 
 | Option | Purpose |
@@ -68,6 +70,7 @@ plugins:
 | `sidecar-path` | Override sidecar location. Leave empty for automatic bootstrap. |
 | `optimize-for` | Router mode for the `auto-smart` model: `cost`, `balanced`, or `intelligence`. |
 | `models` | Fallback ids when model discovery fails. Leave empty to rely on discovery. |
+| `weights` | Per-credential share for weighted routing, keyed by account email or auth file name. |
 
 When the host runs under a service manager, prefer absolute paths for `plugins.dir` and
 `node-path`: the working directory and PATH of a launchd or systemd unit differ from an
@@ -93,6 +96,11 @@ Keys minted this way expire (90 days by default) and Cursor offers no refresh to
 plugin records the expiry in the auth file and schedules the host to re-check it then. Once
 past that point the credential is reported invalid and `--cursor-login` must be run again.
 
+Renewing does not cost you the settings you added to that file. The plugin reads the file it
+is about to replace and carries over everything it does not own — `label`, `prefix`,
+`proxy_url`, `disabled`, `note`, `model_aliases`, `excluded-models` and any custom field —
+while the freshly minted key and its expiry always replace the previous ones.
+
 Login runs on the machine that owns the browser, which is why there is no equivalent flow in
 the management panel or TUI.
 
@@ -110,11 +118,44 @@ for example `auths/cursor-main.json`:
 
 `type` is the provider key `cursor`, not the plugin ID `auth-cursor`.
 
-Optional fields: `label`, `prefix`, `proxy_url`, `disabled`. Dashboard keys carry no expiry
-the plugin can read, so they are re-checked only for presence.
+Optional fields: `label`, `prefix`, `proxy_url`, `disabled`, `note`, and the per-account
+`model_aliases` / `excluded-models` lists described under [Models](#models). Dashboard keys
+carry no expiry the plugin can read, so they are re-checked only for presence.
 
-Add one file per key to load-balance across credentials; the host schedules them like any
-other provider.
+Both sources produce the same thing — one Cursor user API key in one auth file. There is no
+separate `cursor-api-key` config block, and nothing else to set for a key to be picked up.
+
+### Load balancing
+
+Add one file per key to spread traffic across credentials; the host schedules them like any
+other provider. To give some accounts a larger share, switch the host to the weighted
+strategy and list the shares in the plugin config:
+
+```yaml
+routing:
+  strategy: "weighted-round-robin"
+
+plugins:
+  configs:
+    auth-cursor:
+      weights:
+        you@example.com: 5
+        teammate@example.com: 2
+        cursor-service-account.json: 1
+```
+
+Each key is matched case-insensitively against the credential's `email` first, then the auth
+file name with and without the `.json` suffix. A credential you do not list keeps the host
+default share of 1. A share of `0` — or any negative value — parks the credential while the
+weighted strategy is active. The maximum is 1000000, and a value the host would reject fails
+the config load rather than surfacing later as a routing error.
+
+Weights are configured here rather than in the auth file for a reason: `--cursor-login`
+rewrites that file. Do not set `weight` in the auth file as well. The host lets a file-level
+`weight` override whatever the plugin resolved, so a leftover one silently wins and then
+disappears on the next login.
+
+Editing `weights` takes effect through the host's normal config reload; no restart is needed.
 
 ## Models
 
@@ -130,6 +171,33 @@ rejected upstream.
 
 Configuring `models` is not required. It is only a fallback for when discovery fails, so a
 transient catalog error does not drop the provider out of the registry.
+
+### Renaming and hiding models
+
+Cursor credentials are OAuth-kind credentials as far as the host is concerned, so the
+host-level alias and exclusion blocks apply to them. Both are keyed by the provider key
+`cursor`, not by the plugin ID, and both live outside `plugins.configs`:
+
+```yaml
+oauth-model-alias:
+  cursor:
+    - name: "grok-4.6"      # upstream id reported by Cursor
+      alias: "grok-latest"  # id your clients use
+      # fork: true          # also keep the upstream id on /v1/models
+      # display-name: "Grok Latest"
+
+oauth-excluded-models:
+  cursor:
+    - "grok-4.5"
+```
+
+These apply to every Cursor credential. To scope a rename or an exclusion to one account,
+put `model_aliases` / `excluded-models` in that account's auth file instead; the per-account
+list is consulted first and wins over the global block.
+
+One caveat: aliases are applied to the discovered catalog, so ids that come from the
+`models` fallback are published unaliased. This only shows up when discovery has failed for
+that credential.
 
 ## Behaviour and limits
 
@@ -193,7 +261,8 @@ The tests drive the executor against a fake NDJSON sidecar, so they need `node` 
 no Cursor credential and no network access. They cover prompt flattening, image and
 parameter mapping, completion and stream chunk assembly, per-protocol stream framing, the
 host HTTP bridge encoding, sidecar bootstrap resolution, auth file claiming, credential
-expiry, the `--cursor-login` command, and upstream error propagation.
+expiry, weight resolution, the `--cursor-login` command including the settings it carries
+over, and upstream error propagation.
 
 The full bootstrap, including the real `npm install`, is covered by an opt-in test:
 

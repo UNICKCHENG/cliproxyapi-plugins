@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/tidwall/gjson"
 )
 
 // fakeSidecar speaks the same NDJSON protocol as the real sidecar but never contacts
@@ -427,6 +428,160 @@ func TestCommandLineExecuteReturnsLoginAuth(t *testing.T) {
 	}
 }
 
+// loginExecute runs the login command against the fake sidecar with authDir as the host's
+// auth directory, which is where the merge looks for the file it is about to replace.
+func loginExecute(t *testing.T, authDir string) pluginapi.CommandLineExecutionResponse {
+	t.Helper()
+	raw, errExecute := commandLineExecute(mustJSON(t, pluginapi.CommandLineExecutionRequest{
+		Program: "cli-proxy-api",
+		Args:    []string{"--" + loginFlagName},
+		Host:    pluginapi.HostConfigSummary{AuthDir: authDir},
+		Flags: map[string]pluginapi.CommandLineFlagValue{
+			"no-browser": {Name: "no-browser", Value: "true"},
+		},
+		TriggeredFlags: map[string]pluginapi.CommandLineFlagValue{
+			loginFlagName: {Name: loginFlagName, Type: "bool", Value: "true", Set: true},
+		},
+	}))
+	if errExecute != nil {
+		t.Fatalf("commandLineExecute: %v", errExecute)
+	}
+	var response pluginapi.CommandLineExecutionResponse
+	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, raw).Result, &response); errUnmarshal != nil {
+		t.Fatalf("decode execution: %v", errUnmarshal)
+	}
+	if response.ExitCode != 0 {
+		t.Fatalf("exit code = %d, stderr = %s", response.ExitCode, response.Stderr)
+	}
+	if len(response.Auths) != 1 {
+		t.Fatalf("auths = %+v, want exactly one", response.Auths)
+	}
+	return response
+}
+
+// Renewing a key must not discard the routing settings an operator put in the auth file,
+// because the host rewrites that file from what this command returns.
+func TestCommandLineExecutePreservesExistingAuthFileSettings(t *testing.T) {
+	useFakeSidecar(t)
+	authDir := t.TempDir()
+	existing := map[string]any{
+		"type":       providerIdentifier,
+		"api_key":    "key_previous",
+		"email":      "Dev.User+cli@example.com",
+		"expires_at": time.Now().UTC().Add(-time.Hour).Format(time.RFC3339),
+		"label":      "team pool",
+		"prefix":     "cursor-a",
+		"proxy_url":  "socks5://127.0.0.1:1080",
+		"note":       "shared account",
+		"model_aliases": []map[string]string{
+			{"name": "grok-4.3", "alias": "grok-latest"},
+		},
+	}
+	fileName := "cursor-dev.user-cli-example.com.json"
+	if errWrite := os.WriteFile(filepath.Join(authDir, fileName), mustJSON(t, existing), 0o600); errWrite != nil {
+		t.Fatalf("write existing auth file: %v", errWrite)
+	}
+
+	auth := loginExecute(t, authDir).Auths[0]
+	if auth.FileName != fileName {
+		t.Fatalf("file name = %q, want %q so the login replaces the same file", auth.FileName, fileName)
+	}
+
+	// The freshly minted credential has to win over everything the old file recorded.
+	if got := apiKeyFromStorage(auth.StorageJSON); got != "key_minted" {
+		t.Errorf("api key = %q, want the newly minted key_minted", got)
+	}
+	expiry := expiryFromStorage(auth.StorageJSON)
+	if expiry.IsZero() || !expiry.After(time.Now().UTC()) {
+		t.Errorf("expiry = %s, want the new future deadline rather than the stale one", expiry)
+	}
+
+	// Operator-owned settings have to survive.
+	for field, want := range map[string]string{
+		"label":     "team pool",
+		"prefix":    "cursor-a",
+		"proxy_url": "socks5://127.0.0.1:1080",
+		"note":      "shared account",
+	} {
+		if got := gjson.GetBytes(auth.StorageJSON, field).String(); got != want {
+			t.Errorf("%s = %q, want %q", field, got, want)
+		}
+	}
+	if got := gjson.GetBytes(auth.StorageJSON, "model_aliases.0.alias").String(); got != "grok-latest" {
+		t.Errorf("model_aliases.0.alias = %q, want grok-latest", got)
+	}
+	if auth.Prefix != "cursor-a" {
+		t.Errorf("auth prefix = %q, want the preserved cursor-a", auth.Prefix)
+	}
+	if auth.Label != "team pool" {
+		t.Errorf("auth label = %q, want the preserved label", auth.Label)
+	}
+}
+
+// A stale expiry recorded under a different spelling must not survive, otherwise a renewed
+// credential could be reported as already expired.
+func TestCommandLineExecuteClearsStaleCredentialSpellings(t *testing.T) {
+	useFakeSidecar(t)
+	authDir := t.TempDir()
+	fileName := "cursor-dev.user-cli-example.com.json"
+	existing := map[string]any{
+		"type":              providerIdentifier,
+		"apiKey":            "key_previous",
+		"expiresAt":         time.Now().UTC().Add(-time.Hour).Format(time.RFC3339),
+		"apiKeyExpiresAtMs": time.Now().UTC().Add(-time.Hour).UnixMilli(),
+		"prefix":            "cursor-a",
+	}
+	if errWrite := os.WriteFile(filepath.Join(authDir, fileName), mustJSON(t, existing), 0o600); errWrite != nil {
+		t.Fatalf("write existing auth file: %v", errWrite)
+	}
+
+	auth := loginExecute(t, authDir).Auths[0]
+	for _, field := range []string{"apiKey", "expiresAt", "expires_at_ms", "apiKeyExpiresAtMs"} {
+		if gjson.GetBytes(auth.StorageJSON, field).Exists() {
+			t.Errorf("%s survived the merge: %s", field, auth.StorageJSON)
+		}
+	}
+	if expiry := expiryFromStorage(auth.StorageJSON); expiry.IsZero() || !expiry.After(time.Now().UTC()) {
+		t.Errorf("expiry = %s, want the new future deadline", expiry)
+	}
+	if got := gjson.GetBytes(auth.StorageJSON, "prefix").String(); got != "cursor-a" {
+		t.Errorf("prefix = %q, want it preserved alongside the credential reset", got)
+	}
+}
+
+func TestCommandLineExecuteWithoutExistingFile(t *testing.T) {
+	useFakeSidecar(t)
+
+	for _, test := range []struct {
+		name    string
+		authDir func(t *testing.T) string
+	}{
+		{name: "empty auth dir", authDir: func(*testing.T) string { return "" }},
+		{name: "no file for this account", authDir: func(t *testing.T) string { return t.TempDir() }},
+		{
+			name: "malformed existing file",
+			authDir: func(t *testing.T) string {
+				dir := t.TempDir()
+				path := filepath.Join(dir, "cursor-dev.user-cli-example.com.json")
+				if errWrite := os.WriteFile(path, []byte("{not json"), 0o600); errWrite != nil {
+					t.Fatalf("write malformed auth file: %v", errWrite)
+				}
+				return dir
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			auth := loginExecute(t, test.authDir(t)).Auths[0]
+			if got := apiKeyFromStorage(auth.StorageJSON); got != "key_minted" {
+				t.Errorf("api key = %q, want key_minted", got)
+			}
+			if got := gjson.GetBytes(auth.StorageJSON, "email").String(); got != "Dev.User+cli@example.com" {
+				t.Errorf("email = %q, want the account from the login", got)
+			}
+		})
+	}
+}
+
 func TestCommandLineExecuteIgnoresUntriggeredInvocation(t *testing.T) {
 	raw, errExecute := commandLineExecute(mustJSON(t, pluginapi.CommandLineExecutionRequest{
 		Program: "cli-proxy-api",
@@ -476,6 +631,186 @@ func TestRefreshAuthReportsExpiry(t *testing.T) {
 	}
 	if !response.NextRefreshAfter.Equal(expiry) {
 		t.Errorf("next refresh = %s, want the key expiry %s", response.NextRefreshAfter, expiry)
+	}
+}
+
+// useWeights installs a plugin config from YAML so the tests exercise the same decoding and
+// normalization the host performs when it hands the plugin its config block.
+func useWeights(t *testing.T, raw string) {
+	t.Helper()
+	cfg, errDecode := decodeConfig([]byte(raw))
+	if errDecode != nil {
+		t.Fatalf("decodeConfig: %v", errDecode)
+	}
+	currentConfig.Store(cfg)
+	t.Cleanup(func() { currentConfig.Store(defaultPluginConfig()) })
+}
+
+func parseAuthData(t *testing.T, fileName, storage string) pluginapi.AuthData {
+	t.Helper()
+	raw, errParse := parseAuth(mustJSON(t, pluginapi.AuthParseRequest{
+		FileName: fileName,
+		RawJSON:  []byte(storage),
+	}))
+	if errParse != nil {
+		t.Fatalf("parseAuth: %v", errParse)
+	}
+	env := decodeEnvelope(t, raw)
+	if !env.OK {
+		t.Fatalf("parseAuth failed: %+v", env.Error)
+	}
+	var response pluginapi.AuthParseResponse
+	if errUnmarshal := json.Unmarshal(env.Result, &response); errUnmarshal != nil {
+		t.Fatalf("decode auth response: %v", errUnmarshal)
+	}
+	if !response.Handled {
+		t.Fatal("parseAuth declined a cursor auth file")
+	}
+	return response.Auth
+}
+
+func refreshAuthData(t *testing.T, req pluginapi.AuthRefreshRequest) pluginapi.AuthData {
+	t.Helper()
+	raw, errRefresh := refreshAuth(mustJSON(t, req))
+	if errRefresh != nil {
+		t.Fatalf("refreshAuth: %v", errRefresh)
+	}
+	env := decodeEnvelope(t, raw)
+	if !env.OK {
+		t.Fatalf("refreshAuth failed: %+v", env.Error)
+	}
+	var response pluginapi.AuthRefreshResponse
+	if errUnmarshal := json.Unmarshal(env.Result, &response); errUnmarshal != nil {
+		t.Fatalf("decode refresh: %v", errUnmarshal)
+	}
+	return response.Auth
+}
+
+func TestParseAuthAppliesConfiguredWeight(t *testing.T) {
+	useWeights(t, "weights:\n  dev@example.com: 5\n  cursor-team.json: 3\n  cursor-solo: 7\n")
+
+	tests := []struct {
+		name     string
+		fileName string
+		storage  string
+		want     string
+	}{
+		{
+			name:     "account email",
+			fileName: "cursor-dev.json",
+			storage:  `{"type":"cursor","api_key":"key_a","email":"dev@example.com"}`,
+			want:     "5",
+		},
+		{
+			name:     "email matched case-insensitively",
+			fileName: "cursor-dev.json",
+			storage:  `{"type":"cursor","api_key":"key_a","email":"Dev@Example.com"}`,
+			want:     "5",
+		},
+		{
+			name:     "auth file name",
+			fileName: "cursor-team.json",
+			storage:  `{"type":"cursor","api_key":"key_b"}`,
+			want:     "3",
+		},
+		{
+			name:     "auth file name without the json suffix",
+			fileName: "cursor-solo.json",
+			storage:  `{"type":"cursor","api_key":"key_c"}`,
+			want:     "7",
+		},
+		{
+			name:     "email outranks the file name",
+			fileName: "cursor-team.json",
+			storage:  `{"type":"cursor","api_key":"key_d","email":"dev@example.com"}`,
+			want:     "5",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			auth := parseAuthData(t, test.fileName, test.storage)
+			if got := auth.Attributes[weightAttribute]; got != test.want {
+				t.Fatalf("weight = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// An unconfigured credential must carry no weight attribute at all, because the host reads
+// an absent attribute as its default share rather than as zero.
+func TestParseAuthOmitsWeightWhenUnconfigured(t *testing.T) {
+	useWeights(t, "weights:\n  other@example.com: 4\n")
+
+	auth := parseAuthData(t, "cursor-main.json", `{"type":"cursor","api_key":"key_a","email":"dev@example.com"}`)
+	if got, exists := auth.Attributes[weightAttribute]; exists {
+		t.Fatalf("weight = %q, want no attribute", got)
+	}
+}
+
+// A non-positive weight is the documented way to park a credential while the weighted
+// strategy is active, so it has to reach the host as an explicit zero.
+func TestParseAuthWritesZeroForNonPositiveWeight(t *testing.T) {
+	useWeights(t, "weights:\n  zeroed@example.com: 0\n  parked@example.com: -3\n")
+
+	for _, email := range []string{"zeroed@example.com", "parked@example.com"} {
+		auth := parseAuthData(t, "cursor-main.json", `{"type":"cursor","api_key":"key_a","email":"`+email+`"}`)
+		if got := auth.Attributes[weightAttribute]; got != "0" {
+			t.Errorf("%s weight = %q, want 0", email, got)
+		}
+	}
+}
+
+func TestDecodeConfigRejectsUnusableWeights(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+	}{
+		{name: "above the host maximum", raw: "weights:\n  dev@example.com: 1000001\n"},
+		{name: "fractional", raw: "weights:\n  dev@example.com: 1.5\n"},
+		{name: "non-numeric", raw: "weights:\n  dev@example.com: heavy\n"},
+		{name: "empty credential key", raw: "weights:\n  \"  \": 5\n"},
+		{name: "keys collide once normalized", raw: "weights:\n  Dev@Example.com: 5\n  dev@example.com: 2\n"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, errDecode := decodeConfig([]byte(test.raw)); errDecode == nil {
+				t.Fatal("decodeConfig accepted a weight the host would reject")
+			}
+		})
+	}
+}
+
+// A refresh must re-read the config instead of echoing the attribute it was handed, so that
+// an edited weight takes effect without waiting for the credential to be parsed again.
+func TestRefreshAuthReresolvesWeight(t *testing.T) {
+	useWeights(t, "weights:\n  dev@example.com: 6\n")
+
+	auth := refreshAuthData(t, pluginapi.AuthRefreshRequest{
+		AuthID:      "cursor-dev.json",
+		StorageJSON: []byte(`{"type":"cursor","api_key":"key_live","email":"dev@example.com"}`),
+		Attributes:  map[string]string{weightAttribute: "1", "path": "/auths/cursor-dev.json"},
+	})
+	if got := auth.Attributes[weightAttribute]; got != "6" {
+		t.Errorf("weight = %q, want the currently configured 6", got)
+	}
+	if got := auth.Attributes["path"]; got != "/auths/cursor-dev.json" {
+		t.Errorf("path = %q, want the host attribute preserved", got)
+	}
+}
+
+func TestRefreshAuthDropsWeightRemovedFromConfig(t *testing.T) {
+	useWeights(t, "weights: {}\n")
+
+	auth := refreshAuthData(t, pluginapi.AuthRefreshRequest{
+		AuthID:      "cursor-dev.json",
+		StorageJSON: []byte(`{"type":"cursor","api_key":"key_live","email":"dev@example.com"}`),
+		Attributes:  map[string]string{weightAttribute: "9", "path": "/auths/cursor-dev.json"},
+	})
+	if got, exists := auth.Attributes[weightAttribute]; exists {
+		t.Errorf("weight = %q, want the stale attribute dropped", got)
+	}
+	if got := auth.Attributes["path"]; got != "/auths/cursor-dev.json" {
+		t.Errorf("path = %q, want the host attribute preserved", got)
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -17,6 +18,9 @@ const apiKeyRefreshInterval = 365 * 24 * time.Hour
 
 // reloginHint is appended wherever an expired or missing credential needs operator action.
 const reloginHint = "run `--" + loginFlagName + "` to mint a new key"
+
+// weightAttribute is the routing attribute the host reads for weighted round-robin.
+const weightAttribute = "weight"
 
 // parseAuth claims auth files that declare the cursor provider and carry an API key.
 // Files belonging to any other provider are declined so the host keeps looking.
@@ -53,6 +57,7 @@ func parseAuth(raw []byte) ([]byte, error) {
 		Metadata:         map[string]any{"type": providerIdentifier},
 		NextRefreshAfter: refreshDeadline(expiry),
 	}
+	applyConfiguredWeight(&data, req.RawJSON, req.FileName)
 	return okEnvelope(pluginapi.AuthParseResponse{Handled: true, Auth: data})
 }
 
@@ -73,17 +78,89 @@ func refreshAuth(raw []byte) ([]byte, error) {
 			expiry.Format(time.RFC3339), reloginHint)), nil
 	}
 	next := refreshDeadline(expiry)
-	return okEnvelope(pluginapi.AuthRefreshResponse{
-		Auth: pluginapi.AuthData{
-			Provider:         providerIdentifier,
-			ID:               req.AuthID,
-			StorageJSON:      req.StorageJSON,
-			Metadata:         req.Metadata,
-			Attributes:       req.Attributes,
-			NextRefreshAfter: next,
-		},
+	data := pluginapi.AuthData{
+		Provider:         providerIdentifier,
+		ID:               req.AuthID,
+		StorageJSON:      req.StorageJSON,
+		Metadata:         req.Metadata,
+		Attributes:       attributesWithoutWeight(req.Attributes),
 		NextRefreshAfter: next,
-	})
+	}
+	applyConfiguredWeight(&data, req.StorageJSON, req.AuthID)
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: data, NextRefreshAfter: next})
+}
+
+// applyConfiguredWeight publishes the configured weight as a host routing attribute. The
+// host preserves this attribute unless the auth file itself carries a "weight" field, which
+// takes precedence, so credentials that leave it out stay governed by the plugin config.
+func applyConfiguredWeight(data *pluginapi.AuthData, storage []byte, fileName string) {
+	if data == nil {
+		return
+	}
+	weight, configured := configuredWeight(storage, fileName)
+	if !configured {
+		return
+	}
+	if data.Attributes == nil {
+		data.Attributes = make(map[string]string)
+	}
+	data.Attributes[weightAttribute] = strconv.Itoa(weight)
+}
+
+// configuredWeight resolves the weight for one credential from the plugin config.
+func configuredWeight(storage []byte, fileName string) (int, bool) {
+	weights := loadedConfig().Weights
+	if len(weights) == 0 {
+		return 0, false
+	}
+	for _, key := range weightLookupKeys(storage, fileName) {
+		if weight, ok := weights[key]; ok {
+			return int(weight), true
+		}
+	}
+	return 0, false
+}
+
+// weightLookupKeys lists the config keys that can name this credential, most specific
+// first: the account email, then the auth file name with and without its suffix.
+func weightLookupKeys(storage []byte, fileName string) []string {
+	keys := make([]string, 0, 3)
+	add := func(value string) {
+		normalized := strings.ToLower(strings.TrimSpace(value))
+		if normalized == "" {
+			return
+		}
+		for _, existing := range keys {
+			if existing == normalized {
+				return
+			}
+		}
+		keys = append(keys, normalized)
+	}
+	if len(storage) > 0 && gjson.ValidBytes(storage) {
+		add(gjson.GetBytes(storage, "email").String())
+	}
+	name := strings.ToLower(strings.TrimSpace(fileName))
+	add(name)
+	add(strings.TrimSuffix(name, ".json"))
+	return keys
+}
+
+// attributesWithoutWeight copies routing attributes and drops the weight entry so a refresh
+// re-resolves it from the current config instead of pinning the value that was in effect
+// when the credential was first parsed.
+func attributesWithoutWeight(attributes map[string]string) map[string]string {
+	if len(attributes) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(attributes))
+	for key, value := range attributes {
+		if key == weightAttribute {
+			continue
+		}
+		out[key] = value
+	}
+	return out
 }
 
 // loginStart reports that the management/TUI login flow is not wired up. Cursor's sign-in

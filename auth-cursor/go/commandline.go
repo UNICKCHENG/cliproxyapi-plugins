@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/tidwall/gjson"
 )
 
 // loginFlagName is the host-facing flag that triggers the Cursor browser login.
@@ -54,7 +56,7 @@ func commandLineExecute(raw []byte) ([]byte, error) {
 		})
 	}
 
-	auth, errAuth := credential.authData()
+	auth, errAuth := credential.authData(req.Host.AuthDir)
 	if errAuth != nil {
 		return okEnvelope(pluginapi.CommandLineExecutionResponse{
 			Stderr:   []byte(fmt.Sprintf("cursor login succeeded but the credential could not be prepared: %v\n", errAuth)),
@@ -120,13 +122,27 @@ func runLogin(noBrowser bool) (loginCredential, error) {
 	return loginCredential{}, fmt.Errorf("cursor sidecar closed the stream before the login completed")
 }
 
+// credentialFields are the fields a login owns. Every spelling is cleared before the new
+// values are written, so a stale key or expiry left in the previous file can never outrank
+// the credential that was just minted.
+var credentialFields = []string{
+	"type", "email",
+	"api_key", "apiKey",
+	"expires_at", "expiresAt", "expires_at_ms", "apiKeyExpiresAtMs",
+}
+
 // authData renders the credential in the same shape parseAuth already accepts, so a
 // logged-in key and a hand-written key are indistinguishable to the rest of the plugin.
-func (c loginCredential) authData() (pluginapi.AuthData, error) {
-	storage := map[string]any{
-		"type":    providerIdentifier,
-		"api_key": c.apiKey,
+// The host replaces the auth file wholesale, so operator-owned settings already recorded for
+// this account are carried over rather than lost on every renewal.
+func (c loginCredential) authData(authDir string) (pluginapi.AuthData, error) {
+	fileName := c.fileName()
+	storage := existingAuthStorage(authDir, fileName)
+	for _, field := range credentialFields {
+		delete(storage, field)
 	}
+	storage["type"] = providerIdentifier
+	storage["api_key"] = c.apiKey
 	if c.email != "" {
 		storage["email"] = c.email
 	}
@@ -137,16 +153,38 @@ func (c loginCredential) authData() (pluginapi.AuthData, error) {
 	if errMarshal != nil {
 		return pluginapi.AuthData{}, errMarshal
 	}
-	fileName := c.fileName()
 	return pluginapi.AuthData{
-		Provider:         providerIdentifier,
-		ID:               fileName,
-		FileName:         fileName,
-		Label:            firstNonEmpty(c.email, providerIdentifier),
+		Provider: providerIdentifier,
+		ID:       fileName,
+		FileName: fileName,
+		Label:    authLabel(raw, fileName),
+		Prefix:   strings.TrimSpace(gjson.GetBytes(raw, "prefix").String()),
+		ProxyURL: strings.TrimSpace(gjson.GetBytes(raw, "proxy_url").String()),
+		// Read back rather than defaulted: the host writes this flag into the file from the
+		// record it persists, so a preserved "disabled" would be reset by a false here.
+		Disabled:         gjson.GetBytes(raw, "disabled").Bool(),
 		StorageJSON:      raw,
 		Metadata:         map[string]any{"type": providerIdentifier},
 		NextRefreshAfter: refreshDeadline(c.expiresAt),
 	}, nil
+}
+
+// existingAuthStorage reads the auth file this login is about to replace. A missing,
+// unreadable or malformed file simply yields nothing to carry over.
+func existingAuthStorage(authDir, fileName string) map[string]any {
+	authDir = strings.TrimSpace(authDir)
+	if authDir == "" || fileName == "" {
+		return make(map[string]any)
+	}
+	raw, errRead := os.ReadFile(filepath.Join(authDir, fileName))
+	if errRead != nil || len(raw) == 0 {
+		return make(map[string]any)
+	}
+	var existing map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &existing); errUnmarshal != nil || existing == nil {
+		return make(map[string]any)
+	}
+	return existing
 }
 
 // fileName derives a stable per-account file name so logging in again with the same account
@@ -188,13 +226,4 @@ func sanitizeFileComponent(value string) string {
 		}
 	}
 	return strings.Trim(builder.String(), "-._")
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
 }

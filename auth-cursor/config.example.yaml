@@ -7,6 +7,11 @@ auth-dir: "~/.cli-proxy-api"
 api-keys:
   - "your-inbound-api-key"
 
+# Credential selection strategy. Weights in the plugin block below only apply while this is
+# "weighted-round-robin"; the default round-robin ignores them.
+routing:
+  strategy: "weighted-round-robin"
+
 plugins:
   enabled: true
   dir: "plugins"
@@ -32,6 +37,30 @@ plugins:
       # Fallback model ids, used only when Cursor.models.list() is unavailable for a
       # credential. Leave empty to rely entirely on discovery.
       models: []
+      # Per-credential weighted-round-robin share. Keys are matched case-insensitively
+      # against the account email first, then the auth file name with and without ".json".
+      # Omitted credentials use the host default of 1; 0 or a negative value parks the
+      # credential while the weighted strategy is active; the maximum is 1000000.
+      # Weights live here rather than in the auth file because `--cursor-login` rewrites
+      # that file. Do not also set "weight" in the auth file: the file wins if you do.
+      weights: {}
+      # weights:
+      #   you@example.com: 5
+      #   teammate@example.com: 2
+      #   cursor-service-account.json: 1
+
+# Model aliases and exclusions for Cursor credentials. The provider key is `cursor`, not
+# the plugin id, and both blocks are host-level rather than part of the plugin config.
+# oauth-model-alias:
+#   cursor:
+#     - name: "grok-4.3"        # upstream model id reported by Cursor
+#       alias: "grok-latest"    # client-visible id
+#       # fork: true            # keep the upstream id and expose the alias as well
+#       # display-name: "Grok Latest"
+#
+# oauth-excluded-models:
+#   cursor:
+#     - "grok-3-mini"
 
 # Credentials live in auth-dir, one JSON file per Cursor API key. Run
 # `cli-proxy-api --cursor-login` to mint one, or add a dashboard key manually.
@@ -40,4 +69,5 @@ plugins:
 #   auths/cursor-main.json
 #   {"type": "cursor", "api_key": "key_..."}
 #
-# Optional fields: label, prefix, proxy_url, disabled.
+# Optional fields: label, prefix, proxy_url, disabled, note, and the per-account
+# model_aliases / excluded-models lists. Re-running --cursor-login preserves them.
