@@ -1,0 +1,32 @@
+dist/
+node_modules/
+package-lock.json
+
+# `go build ./...` inside a package directory named "go" drops a binary called "go".
+auth-cursor/go/go
+
+
+# Tooling metadata
+.vscode/*
+.worktrees/
+.codex/*
+.claude/*
+.claude
+.gemini/*
+.serena/*
+.agent/*
+.agents
+.pi
+.agents/*
+.opencode/*
+.idea/*
+.beads/*
+.bmad/*
+_bmad/*
+_bmad-output/*
+.gocache/
+.gitnexus/
+
+# macOS
+.DS_Store
+._*

@@ -1,0 +1,43 @@
+# Example CLIProxyAPI configuration for the auth-cursor plugin.
+# Merge the `plugins` block into your own config.yaml.
+
+host: "127.0.0.1"
+port: 8317
+auth-dir: "~/.cli-proxy-api"
+api-keys:
+  - "your-inbound-api-key"
+
+plugins:
+  enabled: true
+  dir: "plugins"
+  # Plugin store source for this plugin. Drop it if you install from source.
+  store-sources:
+    - "https://raw.githubusercontent.com/UNICKCHENG/cliproxyapi-plugins/main/registry.json"
+  configs:
+    # The plugin id, which the host derives from the library file name. This is not the
+    # provider key used by credentials below.
+    auth-cursor:
+      enabled: true
+      priority: 1
+      # Node executable used to run the sidecar. Resolved from PATH by default.
+      # Use an absolute path when the host runs under launchd or systemd, whose PATH
+      # usually omits version-manager installs.
+      node-path: "node"
+      # Directory or index.mjs path. Empty auto-discovers
+      # plugins/<goos>/<goarch>/auth-cursor-sidecar, then falls back to the embedded copy
+      # released into ~/.cli-proxy-api/auth-cursor-sidecar/<version>.
+      sidecar-path: ""
+      # Cursor Router mode applied to the auto-smart model: cost | balanced | intelligence.
+      optimize-for: "balanced"
+      # Fallback model ids, used only when Cursor.models.list() is unavailable for a
+      # credential. Leave empty to rely entirely on discovery.
+      models: []
+
+# Credentials live in auth-dir, one JSON file per Cursor API key. Run
+# `cli-proxy-api --cursor-login` to mint one, or add a dashboard key manually.
+# Note that "type" is the provider key `cursor`, not the plugin id `auth-cursor`:
+#
+#   auths/cursor-main.json
+#   {"type": "cursor", "api_key": "key_..."}
+#
+# Optional fields: label, prefix, proxy_url, disabled.

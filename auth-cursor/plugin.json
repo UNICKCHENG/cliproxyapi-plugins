@@ -1,0 +1,10 @@
+{
+  "id": "auth-cursor",
+  "name": "Cursor Provider",
+  "description": "Call Cursor models through the official @cursor/sdk agent SDK.",
+  "author": "UNICKCHENG",
+  "license": "MIT",
+  "tags": [
+    "provider"
+  ]
+}

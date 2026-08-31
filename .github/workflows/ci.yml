@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  auth-cursor:
+    name: auth-cursor plugin
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: auth-cursor/go/go.mod
+          cache-dependency-path: auth-cursor/go/go.sum
+
+      - name: Check formatting
+        working-directory: auth-cursor/go
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed for:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      # Build the shared library the way a release does, so a c-shared or cgo regression
+      # fails here rather than on a release tag. A plain `go build ./...` would also drop a
+      # binary named after the directory into the tree.
+      - name: Build shared library
+        working-directory: auth-cursor/go
+        env:
+          CGO_ENABLED: "1"
+        run: go build -buildmode=c-shared -o "$RUNNER_TEMP/auth-cursor.so" .
+
+      # The tests drive the plugin against a fake NDJSON sidecar, so they need node on PATH
+      # but no Cursor credential and no network access.
+      - name: Test
+        working-directory: auth-cursor/go
+        run: go test ./...
+
+      - name: Validate registry
+        run: node scripts/validate-registry.mjs
