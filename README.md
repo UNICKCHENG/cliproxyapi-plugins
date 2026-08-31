@@ -33,8 +33,12 @@ The store installs only the dynamic library (`auth-cursor.dylib` / `.so` / `.dll
 scripts are embedded in that library. On the **first use** after an install or upgrade —
 `--cursor-login`, the first server start, or the first request — the plugin:
 
-1. writes the scripts into `~/.cli-proxy-api/auth-cursor-sidecar/<version>/`;
+1. writes the scripts into the user cache directory, `<cache>/cli-proxy-api/auth-cursor-sidecar/<version>/`
+   (`~/Library/Caches` on macOS, `~/.cache` or `$XDG_CACHE_HOME` on Linux, `%LocalAppData%` on Windows);
 2. runs `npm install --omit=dev` there once to fetch `@cursor/sdk`.
+
+The cache directory is deliberate: the default `auth-dir` is `~/.cli-proxy-api`, and anything
+the npm tree leaves there is scanned as a credential candidate.
 
 You do **not** need to copy sidecar files or run `npm install` yourself, and you can leave
 `sidecar-path` empty. You **do** need Node and npm on the machine, and that first use
@@ -145,7 +149,7 @@ curl -H "Authorization: Bearer $API_KEY" localhost:8317/v1/chat/completions \
 If `--cursor-login` already finished the sidecar bootstrap, these requests are fast.
 Otherwise the first `/v1/models` or chat request after an install may take up to a minute
 while `npm install` runs. Later requests reuse
-`~/.cli-proxy-api/auth-cursor-sidecar/<version>/`.
+`<cache>/cli-proxy-api/auth-cursor-sidecar/<version>/`.
 
 ### Common install issues
 
@@ -156,7 +160,8 @@ while `npm install` runs. Later requests reuse
 | `create plugin directory: mkdir plugins: read-only file system` (or `mkdir ~: …`) | Relative `plugins.dir` (`"plugins"`) or a literal `~` is resolved against the service CWD, often `/` under Homebrew `brew services` / launchd. Set an absolute writable path such as `/Users/<you>/.cli-proxy-api/plugins` and restart. Same class of bug: [CLIProxyAPI #4313](https://github.com/router-for-me/CLIProxyAPI/issues/4313). |
 | `no such file or directory` naming `node` | Set an absolute `node-path` (step 5) |
 | `/v1/models` has no Cursor entries | Sidecar failed to start — usually a missing or wrong `node-path` |
-| `--cursor-login` or first start sits on `installing cursor sidecar dependencies` | Normal: first use after install/upgrade runs `npm install` for `@cursor/sdk` (up to ~1 minute, needs npm registry access). Wait for `cursor sidecar dependencies installed`. Later runs reuse `~/.cli-proxy-api/auth-cursor-sidecar/<version>/`. |
+| `--cursor-login` or first start sits on `installing cursor sidecar dependencies` | Normal: first use after install/upgrade runs `npm install` for `@cursor/sdk` (up to ~1 minute, needs npm registry access). Wait for `cursor sidecar dependencies installed`. Later runs reuse `<cache>/cli-proxy-api/auth-cursor-sidecar/<version>/`. |
+| Hundreds of `auth-cursor-sidecar/.../package.json` entries in the auth file list, and `DELETE` on them returns 400 | Plugin version 1.0.0 and earlier bootstrapped the sidecar inside the default `auth-dir`. Upgrade; the plugin deletes `~/.cli-proxy-api/auth-cursor-sidecar/` on its next bootstrap. Remove that directory by hand if you pin `sidecar-path`. |
 
 More detail: [auth-cursor/README.md — Troubleshooting](auth-cursor/README.md#troubleshooting).
 
@@ -206,7 +211,7 @@ make install INSTALL_DIR=/path/to/CLIProxyAPI/plugins
 ```
 
 `make install` also places a ready-to-run sidecar at
-`plugins/<GOOS>/<GOARCH>/auth-cursor-sidecar/`, which the plugin prefers over the home
+`plugins/<GOOS>/<GOARCH>/auth-cursor-sidecar/`, which the plugin prefers over the cache
 bootstrap directory, so a development host never runs `npm install` at request time.
 
 ## Releasing

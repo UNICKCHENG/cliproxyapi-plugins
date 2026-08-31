@@ -44,6 +44,15 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     send({ id: req.id, event: "error", message: "Invalid User API Key", code: "unauthorized", http_status: 401 });
     return;
   }
+  // A refusal raised inside an agent run: Cursor reports no HTTP status for these.
+  if (req.api_key === "region-key") {
+    send({
+      id: req.id,
+      event: "error",
+      message: "Model not available This model provider is not supported in your region.",
+    });
+    return;
+  }
   send({ id: req.id, event: "delta", text: "Hello" });
   send({ id: req.id, event: "delta", text: " world" });
   send({
@@ -155,6 +164,90 @@ func TestExecuteSurfacesUpstreamStatus(t *testing.T) {
 	}
 	if !strings.Contains(env.Error.Message, "401") || !strings.Contains(env.Error.Message, "Invalid User API Key") {
 		t.Errorf("message = %q, want upstream status and reason", env.Error.Message)
+	}
+	// The status has to travel as a field: the host classifies the failure from it, and
+	// without one a rejected key looks like an unclassified fault.
+	if env.Error.HTTPStatus != 401 {
+		t.Errorf("http status = %d, want 401", env.Error.HTTPStatus)
+	}
+}
+
+// A model the account's region cannot reach must fail as a request fault. Reported as an
+// unclassified failure it would park the credential and take down the models it can reach.
+func TestExecuteReportsModelUnavailableAsRequestFault(t *testing.T) {
+	useFakeSidecar(t)
+
+	raw, errExecute := execute(executorRequest(t, "region-key", map[string]any{
+		"model":    "fake-model",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	}))
+	if errExecute != nil {
+		t.Fatalf("execute: %v", errExecute)
+	}
+	env := decodeEnvelope(t, raw)
+	if env.OK {
+		t.Fatal("expected an error envelope for an unavailable model")
+	}
+	if env.Error.HTTPStatus != 400 {
+		t.Errorf("http status = %d, want 400 so the host reads it as a request fault", env.Error.HTTPStatus)
+	}
+	// The host also recognises a request fault from error.type when it has no status, which
+	// is the only channel the stream bridge offers.
+	if got := gjson.Get(env.Error.Message, "error.type").String(); got != "invalid_request_error" {
+		t.Errorf("error.type = %q, want invalid_request_error in %s", got, env.Error.Message)
+	}
+	if got := gjson.Get(env.Error.Message, "error.message").String(); !strings.Contains(got, "not supported in your region") {
+		t.Errorf("error.message = %q, want Cursor's reason preserved", got)
+	}
+}
+
+func TestSidecarEventFailureClassification(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		event      sidecarEvent
+		wantStatus int
+		wantType   string
+	}{
+		{
+			name:       "region refusal without a status",
+			event:      sidecarEvent{Message: "Model not available This model provider is not supported in your region."},
+			wantStatus: 400,
+			wantType:   "invalid_request_error",
+		},
+		{
+			name:       "plan restriction",
+			event:      sidecarEvent{Message: "claude-opus-5 is not available on your plan"},
+			wantStatus: 400,
+			wantType:   "invalid_request_error",
+		},
+		{
+			name:       "rejected key keeps its own status",
+			event:      sidecarEvent{Message: "Invalid User API Key", HTTPStatus: 401},
+			wantStatus: 401,
+		},
+		{
+			// Cursor pairs rate limits with prose about model availability often enough that
+			// the status has to win, otherwise a throttled credential stops being cooled.
+			name:       "rate limit outranks availability wording",
+			event:      sidecarEvent{Message: "model unavailable, too many requests", HTTPStatus: 429},
+			wantStatus: 429,
+		},
+		{
+			name:       "unrecognised failure stays unclassified",
+			event:      sidecarEvent{Message: "cursor run failed"},
+			wantStatus: 0,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			failure := test.event.failure()
+			if failure.HTTPStatus != test.wantStatus {
+				t.Errorf("status = %d, want %d", failure.HTTPStatus, test.wantStatus)
+			}
+			gotType := gjson.Get(failure.Message, "error.type").String()
+			if gotType != test.wantType {
+				t.Errorf("error.type = %q, want %q in %s", gotType, test.wantType, failure.Message)
+			}
+		})
 	}
 }
 

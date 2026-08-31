@@ -15,10 +15,10 @@ import (
 // same name. It follows the distribution id (auth-cursor), not the provider key (cursor).
 const sidecarDirName = "auth-cursor-sidecar"
 
-// bootstrapSidecarScript materialises the embedded sidecar under the user's home directory
+// bootstrapSidecarScript materialises the embedded sidecar under the user's cache directory
 // and returns the path to its entrypoint.
 //
-// A home-relative location is deliberate: the plugin store installs only the dynamic
+// A user-relative location is deliberate: the plugin store installs only the dynamic
 // library, and the host process working directory is not stable (a service manager may
 // start it anywhere), so neither can be used to locate the sidecar.
 func bootstrapSidecarScript(cfg pluginConfig) (string, error) {
@@ -35,17 +35,49 @@ func bootstrapSidecarScript(cfg pluginConfig) (string, error) {
 	if errDeps := ensureSidecarDependencies(cfg, dir); errDeps != nil {
 		return "", errDeps
 	}
+	removeLegacySidecarRoot()
 	return filepath.Join(dir, "index.mjs"), nil
 }
 
 // sidecarBootstrapDir keys the directory by plugin version so that upgrading the library
 // never reuses a sidecar built for a different protocol.
+//
+// The cache directory rather than ~/.cli-proxy-api: the latter is the host's default
+// auth-dir, and every file the npm tree drops there is scanned as a credential candidate,
+// which surfaces hundreds of node_modules manifests as bogus auth files.
 func sidecarBootstrapDir() (string, error) {
+	cache, errCache := os.UserCacheDir()
+	if errCache != nil {
+		return "", fmt.Errorf("resolve cache directory for the cursor sidecar: %w", errCache)
+	}
+	return filepath.Join(cache, "cli-proxy-api", sidecarDirName, pluginVersion), nil
+}
+
+// legacySidecarRoot names the pre-move bootstrap root inside the host's default auth-dir.
+func legacySidecarRoot() string {
 	home, errHome := os.UserHomeDir()
 	if errHome != nil {
-		return "", fmt.Errorf("resolve home directory for the cursor sidecar: %w", errHome)
+		return ""
 	}
-	return filepath.Join(home, ".cli-proxy-api", sidecarDirName, pluginVersion), nil
+	return filepath.Join(home, ".cli-proxy-api", sidecarDirName)
+}
+
+// removeLegacySidecarRoot deletes the bootstrap tree earlier versions wrote into the auth
+// directory. Leaving it in place keeps the host reporting every node_modules manifest as an
+// auth file, and those entries cannot be removed through the management API.
+func removeLegacySidecarRoot() {
+	root := legacySidecarRoot()
+	if root == "" || !directoryExists(root) {
+		return
+	}
+	if errRemove := os.RemoveAll(root); errRemove != nil {
+		hostLog("warn", "cursor sidecar legacy directory could not be removed", map[string]any{
+			"path":  root,
+			"error": errRemove.Error(),
+		})
+		return
+	}
+	hostLog("info", "cursor sidecar legacy directory removed from auth-dir", map[string]any{"path": root})
 }
 
 // syncSidecarAssets writes any embedded file that is missing or differs on disk, so a
@@ -120,7 +152,7 @@ func npmExecutable(cfg pluginConfig) (string, error) {
 			return resolved, nil
 		}
 	}
-	return "", fmt.Errorf("npm not found next to %q or on PATH; install Node.js 22.13+ or set plugins.configs.cursor.sidecar-path to a prepared sidecar", cfg.NodePath)
+	return "", fmt.Errorf("npm not found next to %q or on PATH; install Node.js 22.13+ or set plugins.configs.auth-cursor.sidecar-path to a prepared sidecar", cfg.NodePath)
 }
 
 // nodeDirectory resolves the directory holding the configured Node executable, following a

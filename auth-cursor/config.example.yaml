@@ -32,7 +32,8 @@ plugins:
       node-path: "node"
       # Directory or index.mjs path. Empty auto-discovers
       # plugins/<goos>/<goarch>/auth-cursor-sidecar, then falls back to the embedded copy
-      # released into ~/.cli-proxy-api/auth-cursor-sidecar/<version>.
+      # released into the user cache directory, <cache>/cli-proxy-api/auth-cursor-sidecar/<version>
+      # (~/Library/Caches on macOS, ~/.cache on Linux, %LocalAppData% on Windows).
       sidecar-path: ""
       # Cursor Router mode applied to the auto-smart model: cost | balanced | intelligence.
       optimize-for: "balanced"

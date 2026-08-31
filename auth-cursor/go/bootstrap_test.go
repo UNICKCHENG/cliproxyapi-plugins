@@ -82,6 +82,58 @@ func TestSidecarBootstrapDirIsVersioned(t *testing.T) {
 	}
 }
 
+// The bootstrap tree must stay out of the host's default auth-dir: everything under it is
+// scanned as a credential candidate, and an npm tree there floods the auth file list with
+// node_modules manifests that cannot be deleted through the management API.
+func TestSidecarBootstrapDirIsOutsideAuthDir(t *testing.T) {
+	dir, errDir := sidecarBootstrapDir()
+	if errDir != nil {
+		t.Fatalf("sidecarBootstrapDir() error = %v", errDir)
+	}
+	home, errHome := os.UserHomeDir()
+	if errHome != nil {
+		t.Skipf("home directory is required: %v", errHome)
+	}
+	authDir := filepath.Join(home, ".cli-proxy-api")
+	relative, errRelative := filepath.Rel(authDir, dir)
+	if errRelative == nil && !strings.HasPrefix(relative, "..") {
+		t.Fatalf("bootstrap dir = %q, want it outside the default auth-dir %q", dir, authDir)
+	}
+}
+
+func TestRemoveLegacySidecarRootDeletesTreeInAuthDir(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	legacy := filepath.Join(home, ".cli-proxy-api", sidecarDirName, "0.0.0", "node_modules", "@cursor", "sdk")
+	if errMkdir := os.MkdirAll(legacy, 0o700); errMkdir != nil {
+		t.Fatalf("seed legacy sidecar tree: %v", errMkdir)
+	}
+	manifest := filepath.Join(legacy, "package.json")
+	if errWrite := os.WriteFile(manifest, []byte(`{"name":"@cursor/sdk"}`), 0o600); errWrite != nil {
+		t.Fatalf("seed legacy manifest: %v", errWrite)
+	}
+
+	removeLegacySidecarRoot()
+
+	if directoryExists(filepath.Join(home, ".cli-proxy-api", sidecarDirName)) {
+		t.Fatal("legacy sidecar root survived the cleanup")
+	}
+	// Only the plugin's own directory may be removed; the auth directory holds credentials.
+	if !directoryExists(filepath.Join(home, ".cli-proxy-api")) {
+		t.Fatal("cleanup removed the auth directory itself")
+	}
+}
+
+func TestRemoveLegacySidecarRootIgnoresMissingTree(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	removeLegacySidecarRoot()
+}
+
 func TestResolveSidecarScriptPrefersConfiguredPath(t *testing.T) {
 	t.Parallel()
 
@@ -132,9 +184,15 @@ func TestBootstrapSidecarScriptInstallsDependencies(t *testing.T) {
 	if errLook != nil {
 		t.Skipf("node is required: %v", errLook)
 	}
-	// bootstrapSidecarScript resolves the home directory, which t.Setenv redirects.
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("USERPROFILE", t.TempDir())
+	// bootstrapSidecarScript resolves the cache and home directories, which t.Setenv redirects.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	legacyRoot := filepath.Join(home, ".cli-proxy-api", sidecarDirName)
+	if errMkdir := os.MkdirAll(filepath.Join(legacyRoot, "0.0.0"), 0o700); errMkdir != nil {
+		t.Fatalf("seed legacy sidecar tree: %v", errMkdir)
+	}
 
 	script, errBootstrap := bootstrapSidecarScript(pluginConfig{NodePath: node})
 	if errBootstrap != nil {
@@ -142,6 +200,12 @@ func TestBootstrapSidecarScriptInstallsDependencies(t *testing.T) {
 	}
 	if !fileExists(script) {
 		t.Fatalf("bootstrapped script %q does not exist", script)
+	}
+	if strings.HasPrefix(script, filepath.Join(home, ".cli-proxy-api")+string(filepath.Separator)) {
+		t.Fatalf("bootstrapped script %q landed in the default auth-dir", script)
+	}
+	if directoryExists(legacyRoot) {
+		t.Fatalf("bootstrap left the legacy tree %q inside the auth-dir", legacyRoot)
 	}
 	if !directoryExists(filepath.Join(filepath.Dir(script), "node_modules", "@cursor", "sdk")) {
 		t.Fatal("bootstrap did not install @cursor/sdk")

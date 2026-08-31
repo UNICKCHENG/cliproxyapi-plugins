@@ -53,7 +53,7 @@ plugins:
       # Under launchd or systemd, set an absolute path — see the install guide.
       node-path: "node"
       # Leave empty: the plugin auto-discovers a local auth-cursor-sidecar directory,
-      # then falls back to ~/.cli-proxy-api/auth-cursor-sidecar/<version>/.
+      # then falls back to <cache>/cli-proxy-api/auth-cursor-sidecar/<version>/.
       sidecar-path: ""
       # Cursor Router mode applied to the auto-smart model: cost | balanced | intelligence.
       optimize-for: "balanced"
@@ -212,6 +212,11 @@ list is consulted first and wins over the global block.
 - **No token counting endpoint.** `count_tokens` returns a character-based estimate; billing
   uses the counts Cursor reports after a run.
 - **No raw HTTP passthrough.** `executor.http_request` returns 501.
+- **Upstream failures are classified before the host sees them.** The plugin forwards
+  Cursor's HTTP status so a rejected key, a rate limit and a server error each get the
+  handling they deserve. Refusals that carry no status — a model the account's region or
+  plan cannot reach — are reported as request faults, so they fail that one request without
+  parking the credential for every other model.
 - **Stream framing depends on the caller.** Chat-completions clients receive chunks that the
   host frames itself, while other protocols go through a response translator that requires
   `data:` frames. The executor picks the framing from the inbound request path; without it,
@@ -242,7 +247,10 @@ Review Cursor's current terms before deploying; this document is not legal advic
 | `/v1/models` has no Cursor entries | Discovery failed for that credential, usually because the sidecar cannot start |
 | `no such file or directory` naming `node` | `node-path` is not resolvable from the host's PATH; set an absolute path (see the [install guide](../README.md#install-auth-cursor)) |
 | `cursor upstream error 401: Invalid User API Key` | The key is rejected; the host then parks the credential, so later requests report `auth_unavailable` instead of repeating the 401 |
-| `--cursor-login` or first start sits on `installing cursor sidecar dependencies` | Normal: first use after install/upgrade runs `npm install` for `@cursor/sdk` (up to ~1 minute). Wait; later runs reuse `~/.cli-proxy-api/auth-cursor-sidecar/<version>/`. |
+| `--cursor-login` or first start sits on `installing cursor sidecar dependencies` | Normal: first use after install/upgrade runs `npm install` for `@cursor/sdk` (up to ~1 minute). Wait; later runs reuse `<cache>/cli-proxy-api/auth-cursor-sidecar/<version>/`. |
+| Hundreds of `auth-cursor-sidecar/.../package.json` credentials in the management panel, and `DELETE /v0/management/auth-files` on them returns 400 | Version 1.0.0 and earlier bootstrapped the sidecar into `~/.cli-proxy-api`, which is the default `auth-dir`, so every npm manifest was scanned as a credential. Upgrading moves the sidecar to the user cache directory and deletes the old tree on the next bootstrap. Delete `~/.cli-proxy-api/auth-cursor-sidecar/` by hand if you pin `sidecar-path`, because then the plugin never bootstraps. |
+| `Model not available … not supported in your region` | The account's region or plan cannot reach that model — typically the Claude and GPT entries. Only the requested model is refused; the credential keeps serving the rest. Hide the unreachable ids with `oauth-excluded-models.cursor`, or per account with `excluded-models` in the auth file. |
+| Every Cursor request reports `503 auth_unavailable` after one model failed | An unclassified upstream failure parks the credential for a cooldown window. Check `~/.cli-proxy-api/logs/main.log` for the `upstream execution failed` line naming the real cause; `disable-cooling: true` is an emergency escape while you fix it. |
 
 ## Development
 
@@ -258,9 +266,9 @@ make test
 The tests drive the executor against a fake NDJSON sidecar, so they need `node` on PATH but
 no Cursor credential and no network access. They cover prompt flattening, image and
 parameter mapping, completion and stream chunk assembly, per-protocol stream framing, the
-host HTTP bridge encoding, sidecar bootstrap resolution, auth file claiming, credential
-expiry, weight resolution, the `--cursor-login` command including the settings it carries
-over, and upstream error propagation.
+host HTTP bridge encoding, sidecar bootstrap resolution including the move out of the auth
+directory, auth file claiming, credential expiry, weight resolution, the `--cursor-login`
+command including the settings it carries over, and upstream error classification.
 
 The full bootstrap, including the real `npm install`, is covered by an opt-in test:
 

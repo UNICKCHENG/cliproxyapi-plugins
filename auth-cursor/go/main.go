@@ -79,9 +79,14 @@ type envelope struct {
 	Error  *envelopeError  `json:"error,omitempty"`
 }
 
+// envelopeError mirrors pluginabi.Error. HTTPStatus and Retryable are what let the host
+// classify a failure: without a status every upstream error lands in the host's generic
+// failure branch, which cools the credential instead of the one model that failed.
 type envelopeError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	Retryable  bool   `json:"retryable,omitempty"`
+	HTTPStatus int    `json:"http_status,omitempty"`
 }
 
 type lifecycleRequest struct {
@@ -241,6 +246,18 @@ func okEnvelope(v any) ([]byte, error) {
 
 func errorEnvelope(code, message string) []byte {
 	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
+	return raw
+}
+
+// upstreamErrorEnvelope reports a failed upstream call with the status and retryability the
+// host needs to decide whether the credential is at fault.
+func upstreamErrorEnvelope(code, message string, httpStatus int, retryable bool) []byte {
+	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
+		Code:       code,
+		Message:    message,
+		Retryable:  retryable,
+		HTTPStatus: httpStatus,
+	}})
 	return raw
 }
 

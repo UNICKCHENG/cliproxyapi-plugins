@@ -61,7 +61,8 @@ func execute(raw []byte) ([]byte, error) {
 				Headers: http.Header{"Content-Type": []string{"application/json"}},
 			})
 		case "error":
-			return errorEnvelope("executor_error", event.errorText()), nil
+			failure := event.failure()
+			return upstreamErrorEnvelope("executor_error", failure.Message, failure.HTTPStatus, failure.Retryable), nil
 		}
 	}
 	return errorEnvelope("executor_error", "cursor sidecar closed the stream before completing"), nil
@@ -145,7 +146,8 @@ func forwardStream(streamID, model string, framing streamFraming, sidecarReq sid
 			return emitPluginStreamChunk(streamID, framing.terminator())
 		case "error":
 			cancel()
-			return fmt.Errorf("%s", event.errorText())
+			// The stream bridge carries only text, so the classification has to be in it.
+			return fmt.Errorf("%s", event.failure().Message)
 		}
 	}
 	return fmt.Errorf("cursor sidecar closed the stream before completing")

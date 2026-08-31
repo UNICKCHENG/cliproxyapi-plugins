@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -96,6 +97,75 @@ func (e sidecarEvent) errorText() string {
 		return fmt.Sprintf("cursor upstream error %d: %s", e.HTTPStatus, message)
 	}
 	return message
+}
+
+// modelUnavailableMarkers identify a Cursor refusal to serve one model to this account:
+// region restrictions and plan or team policy. These are properties of the request, not of
+// the credential, so they must not be reported as an unclassified failure.
+var modelUnavailableMarkers = []string{
+	"not supported in your region",
+	"not available in your region",
+	"model not available",
+	"model is not available",
+	"model not supported",
+	"model is not supported",
+	"not available on your plan",
+	"not available for your plan",
+}
+
+// upstreamFailure describes a failed run in the terms the host classifies on.
+type upstreamFailure struct {
+	// Message is the text the host receives. It is a JSON error body whenever the
+	// classification has to survive a channel that carries no status code.
+	Message string
+	// HTTPStatus is the status the host attributes to the failure, or zero when unknown.
+	HTTPStatus int
+	// Retryable reports whether Cursor marked the failure as worth retrying.
+	Retryable bool
+}
+
+// failure classifies an error event for the host.
+//
+// Cursor reports a status for transport-level failures (a rejected key is 401) but not for
+// refusals raised inside an agent run, which arrive as a bare message. An unclassified
+// failure makes the host park the whole credential, so one model the account cannot reach
+// takes down every model it can reach. A region or plan refusal is therefore reported as a
+// request fault, in a JSON body because the streaming path can only carry text: the host
+// reads error.type out of the body when no status is available.
+func (e sidecarEvent) failure() upstreamFailure {
+	if e.modelUnavailable() {
+		message := strings.TrimSpace(e.Message)
+		body, errMarshal := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"type":    "invalid_request_error",
+				"code":    "model_not_available",
+				"message": message,
+			},
+		})
+		if errMarshal == nil {
+			return upstreamFailure{Message: string(body), HTTPStatus: http.StatusBadRequest}
+		}
+	}
+	return upstreamFailure{
+		Message:    e.errorText(),
+		HTTPStatus: e.HTTPStatus,
+		Retryable:  e.Retryable,
+	}
+}
+
+// modelUnavailable reports whether Cursor refused the model itself rather than the key.
+func (e sidecarEvent) modelUnavailable() bool {
+	// A credential or rate-limit status is authoritative and must keep its own handling.
+	if e.HTTPStatus > 0 && e.HTTPStatus != http.StatusBadRequest {
+		return false
+	}
+	lower := strings.ToLower(e.Message)
+	for _, marker := range modelUnavailableMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (e sidecarEvent) terminal() bool {
