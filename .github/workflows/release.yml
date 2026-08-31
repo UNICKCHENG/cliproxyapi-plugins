@@ -26,7 +26,8 @@ jobs:
             goos: darwin
             goarch: arm64
             extension: dylib
-          - runner: macos-13
+          # macos-13 was retired in Dec 2025. macos-15-intel is the hosted x86_64 replacement.
+          - runner: macos-15-intel
             goos: darwin
             goarch: amd64
             extension: dylib

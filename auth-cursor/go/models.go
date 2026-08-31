@@ -13,16 +13,14 @@ import (
 // registration, which runs without a credential, can still describe the provider.
 var discoveredCatalog atomic.Value
 
-// staticModels advertises the provider before any credential is consulted. The host binds a
-// plugin executor to its provider through this list, so returning nothing would leave the
-// provider unroutable. Configured ids bootstrap the first run; afterwards the last successful
-// discovery keeps the list accurate without hard-coding Cursor's catalog.
+// staticModels advertises the provider before any credential is consulted. The executor is
+// bound to its provider through the executor identifier rather than this list, so an empty
+// response only leaves the provider without registered models until the first per-credential
+// discovery succeeds. Cursor's catalog is never hard-coded here.
 func staticModels() ([]byte, error) {
-	models := modelsFromIDs(loadedConfig().Models)
-	if len(models) == 0 {
-		if cached, ok := discoveredCatalog.Load().([]pluginapi.ModelInfo); ok {
-			models = cached
-		}
+	var models []pluginapi.ModelInfo
+	if cached, ok := discoveredCatalog.Load().([]pluginapi.ModelInfo); ok {
+		models = cached
 	}
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerIdentifier, Models: models})
 }
@@ -35,28 +33,22 @@ func modelsForAuth(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	cfg := loadedConfig()
 	apiKey, errKey := requireAPIKey(req.StorageJSON)
 	if errKey != nil {
-		return okEnvelope(pluginapi.ModelResponse{
-			Provider: providerIdentifier,
-			Models:   modelsFromIDs(cfg.Models),
-		})
+		return okEnvelope(pluginapi.ModelResponse{Provider: providerIdentifier})
 	}
 
 	models, errDiscover := discoverModels(apiKey)
 	if errDiscover != nil || len(models) == 0 {
-		// Discovery is best effort: a transient catalog failure should not drop the
-		// provider's models out of the registry entirely.
+		// The credential keeps no models until a later discovery succeeds, which is what the
+		// host reads as "this credential currently serves nothing".
 		reason := "empty catalog"
 		if errDiscover != nil {
 			reason = errDiscover.Error()
 		}
-		models = modelsFromIDs(cfg.Models)
-		hostLog("warn", "cursor model discovery failed, using configured fallback models", map[string]any{
-			"auth_id":  req.AuthID,
-			"reason":   reason,
-			"fallback": len(models),
+		hostLog("warn", "cursor model discovery failed", map[string]any{
+			"auth_id": req.AuthID,
+			"reason":  reason,
 		})
 	} else {
 		discoveredCatalog.Store(models)
@@ -116,29 +108,6 @@ func modelInfoFromCatalog(model sidecarModel) (pluginapi.ModelInfo, bool) {
 		SupportedOutputModalities:  []string{"text"},
 		SupportedParameters:        model.Parameters,
 	}, true
-}
-
-func modelsFromIDs(ids []string) []pluginapi.ModelInfo {
-	models := make([]pluginapi.ModelInfo, 0, len(ids))
-	for _, id := range ids {
-		id = strings.TrimSpace(id)
-		if id == "" {
-			continue
-		}
-		models = append(models, pluginapi.ModelInfo{
-			ID:                         id,
-			Object:                     "model",
-			OwnedBy:                    providerIdentifier,
-			Type:                       "chat",
-			DisplayName:                id,
-			Name:                       id,
-			SupportedGenerationMethods: []string{"chat"},
-			SupportedInputModalities:   []string{"text", "image"},
-			SupportedOutputModalities:  []string{"text"},
-			UserDefined:                true,
-		})
-	}
-	return models
 }
 
 type sidecarError string

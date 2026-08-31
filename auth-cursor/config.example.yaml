@@ -23,7 +23,6 @@ plugins:
     # provider key used by credentials below.
     auth-cursor:
       enabled: true
-      priority: 1
       # Node executable used to run the sidecar. Resolved from PATH by default.
       # Use an absolute path when the host runs under launchd or systemd, whose PATH
       # usually omits version-manager installs.
@@ -34,9 +33,6 @@ plugins:
       sidecar-path: ""
       # Cursor Router mode applied to the auto-smart model: cost | balanced | intelligence.
       optimize-for: "balanced"
-      # Fallback model ids, used only when Cursor.models.list() is unavailable for a
-      # credential. Leave empty to rely entirely on discovery.
-      models: []
       # Per-credential weighted-round-robin share. Keys are matched case-insensitively
       # against the account email first, then the auth file name with and without ".json".
       # Omitted credentials use the host default of 1; 0 or a negative value parks the
@@ -53,20 +49,20 @@ plugins:
 # the plugin id, and both blocks are host-level rather than part of the plugin config.
 # oauth-model-alias:
 #   cursor:
-#     - name: "grok-4.3"        # upstream model id reported by Cursor
+#     - name: "grok-4.6"        # upstream model id reported by Cursor
 #       alias: "grok-latest"    # client-visible id
 #       # fork: true            # keep the upstream id and expose the alias as well
 #       # display-name: "Grok Latest"
 #
 # oauth-excluded-models:
 #   cursor:
-#     - "grok-3-mini"
+#     - "grok-4.5"
 
 # Credentials live in auth-dir, one JSON file per Cursor API key. Run
 # `cli-proxy-api --cursor-login` to mint one, or add a dashboard key manually.
 # Note that "type" is the provider key `cursor`, not the plugin id `auth-cursor`:
 #
-#   auths/cursor-main.json
+#   $(auth-dir)/cursor-*.json
 #   {"type": "cursor", "api_key": "key_..."}
 #
 # Optional fields: label, prefix, proxy_url, disabled, note, and the per-account

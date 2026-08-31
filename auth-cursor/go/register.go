@@ -28,10 +28,9 @@ var pluginVersion = "0.0.0-dev"
 var currentConfig atomic.Value
 
 type pluginConfig struct {
-	NodePath    string   `yaml:"node-path"`
-	SidecarPath string   `yaml:"sidecar-path"`
-	OptimizeFor string   `yaml:"optimize-for"`
-	Models      []string `yaml:"models"`
+	NodePath    string `yaml:"node-path"`
+	SidecarPath string `yaml:"sidecar-path"`
+	OptimizeFor string `yaml:"optimize-for"`
 	// Weights maps a credential, named by account email or auth file name, to its
 	// weighted-round-robin share. Weights live here instead of in the auth file because the
 	// login flow rewrites that file and would drop them on every renewal.
@@ -117,13 +116,6 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 	if cfg.OptimizeFor == "" {
 		cfg.OptimizeFor = defaultOptimizeFor
 	}
-	models := make([]string, 0, len(cfg.Models))
-	for _, model := range cfg.Models {
-		if trimmed := strings.TrimSpace(model); trimmed != "" {
-			models = append(models, trimmed)
-		}
-	}
-	cfg.Models = models
 	weights, errWeights := normalizeWeights(cfg.Weights)
 	if errWeights != nil {
 		return pluginConfig{}, errWeights
@@ -193,11 +185,6 @@ func pluginRegistration() registration {
 					Type:        pluginapi.ConfigFieldTypeEnum,
 					EnumValues:  []string{"cost", "balanced", "intelligence"},
 					Description: "Cursor Router optimization mode applied to the auto-smart model.",
-				},
-				{
-					Name:        "models",
-					Type:        pluginapi.ConfigFieldTypeArray,
-					Description: "Fallback model ids used when Cursor.models.list() is unavailable for a credential.",
 				},
 				{
 					Name:        "weights",

@@ -55,11 +55,9 @@ plugins:
   configs:
     auth-cursor:
       enabled: true
-      priority: 1
       node-path: "node"   # see step 5 if you run under a service manager
       sidecar-path: ""
       optimize-for: "balanced"
-      models: []
       weights: {}         # per-credential share for weighted routing
 ```
 
@@ -149,7 +147,7 @@ sidecar bootstraps and runs `npm install`. Later requests reuse
 | Plugin missing from `/v0/management/plugins` | `plugins.enabled` is off, or `plugins.dir` does not resolve |
 | `"registered": false` | The library failed to load; the binary may lack CGO plugin support |
 | `no such file or directory` naming `node` | Set an absolute `node-path` (step 5) |
-| `/v1/models` returns only configured `models` | Sidecar failed to start — usually a missing or wrong `node-path` |
+| `/v1/models` has no Cursor entries | Sidecar failed to start — usually a missing or wrong `node-path` |
 | First request hangs ~1 minute | Normal: sidecar bootstrap is running `npm install` |
 
 More detail: [auth-cursor/README.md — Troubleshooting](auth-cursor/README.md#troubleshooting).

@@ -49,7 +49,6 @@ plugins:
   configs:
     auth-cursor:
       enabled: true
-      priority: 1
       # Node executable used to run the sidecar. Defaults to "node" from PATH.
       # Under launchd or systemd, set an absolute path — see the install guide.
       node-path: "node"
@@ -58,8 +57,6 @@ plugins:
       sidecar-path: ""
       # Cursor Router mode applied to the auto-smart model: cost | balanced | intelligence.
       optimize-for: "balanced"
-      # Fallback model ids used only when Cursor.models.list() is unavailable.
-      models: []
       # Per-credential share for weighted-round-robin routing. See "Load balancing".
       weights: {}
 ```
@@ -69,7 +66,6 @@ plugins:
 | `node-path` | Node binary that runs the sidecar. Required at runtime; not bundled by the store install. |
 | `sidecar-path` | Override sidecar location. Leave empty for automatic bootstrap. |
 | `optimize-for` | Router mode for the `auto-smart` model: `cost`, `balanced`, or `intelligence`. |
-| `models` | Fallback ids when model discovery fails. Leave empty to rely on discovery. |
 | `weights` | Per-credential share for weighted routing, keyed by account email or auth file name. |
 
 When the host runs under a service manager, prefer absolute paths for `plugins.dir` and
@@ -169,8 +165,9 @@ Other per-model parameters are validated against the catalog and dropped when un
 so a `reasoning_effort` sent to a model that has no such parameter is ignored rather than
 rejected upstream.
 
-Configuring `models` is not required. It is only a fallback for when discovery fails, so a
-transient catalog error does not drop the provider out of the registry.
+Discovery is the only source of the catalog; there is no model list to configure. When it
+fails for a credential the plugin publishes nothing for that key, so `/v1/models` carries no
+Cursor entries until a later discovery succeeds.
 
 ### Renaming and hiding models
 
@@ -194,10 +191,6 @@ oauth-excluded-models:
 These apply to every Cursor credential. To scope a rename or an exclusion to one account,
 put `model_aliases` / `excluded-models` in that account's auth file instead; the per-account
 list is consulted first and wins over the global block.
-
-One caveat: aliases are applied to the discovered catalog, so ids that come from the
-`models` fallback are published unaliased. This only shows up when discovery has failed for
-that credential.
 
 ## Behaviour and limits
 
@@ -241,7 +234,7 @@ Review Cursor's current terms before deploying; this document is not legal advic
 | --- | --- |
 | Plugin missing from `/v0/management/plugins` | `plugins.enabled` is off, or `plugins.dir` does not resolve — use an absolute path under a service manager |
 | `"registered": false` | The library failed to load; the host binary may lack CGO plugin support |
-| `/v1/models` returns only the configured `models` | Discovery failed for that credential, usually because the sidecar cannot start |
+| `/v1/models` has no Cursor entries | Discovery failed for that credential, usually because the sidecar cannot start |
 | `no such file or directory` naming `node` | `node-path` is not resolvable from the host's PATH; set an absolute path (see the [install guide](../README.md#install-auth-cursor)) |
 | `cursor upstream error 401: Invalid User API Key` | The key is rejected; the host then parks the credential, so later requests report `auth_unavailable` instead of repeating the 401 |
 | First request hangs for a minute | The one-time sidecar bootstrap is running `npm install`; check the logs for `installing cursor sidecar dependencies` |
