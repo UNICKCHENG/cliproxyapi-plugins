@@ -83,6 +83,10 @@ The plugin registers a `--cursor-login` flag on the host binary:
 ./cli-proxy-api --cursor-login --no-browser # prints the URL instead
 ```
 
+The first run after an install or upgrade may pause on
+`installing cursor sidecar dependencies` while `npm install` fetches `@cursor/sdk`. Wait
+for that to finish; the sign-in URL is printed afterwards.
+
 The sign-in URL is printed as soon as Cursor reports it. Completing the login mints a user
 API key named `CLIProxyAPI`, and the host saves it into the configured `auth-dir` as
 `cursor-<account>.json`, so logging in again with the same account replaces that file
@@ -234,10 +238,11 @@ Review Cursor's current terms before deploying; this document is not legal advic
 | --- | --- |
 | Plugin missing from `/v0/management/plugins` | `plugins.enabled` is off, or `plugins.dir` does not resolve — use an absolute path under a service manager |
 | `"registered": false` | The library failed to load; the host binary may lack CGO plugin support |
+| `create plugin directory: mkdir plugins: read-only file system` (or `mkdir ~: …`) | Relative `plugins.dir` or a literal `~` is resolved against the Homebrew/launchd CWD (`/`). Use `/Users/<you>/.cli-proxy-api/plugins`. See [CLIProxyAPI #4313](https://github.com/router-for-me/CLIProxyAPI/issues/4313). |
 | `/v1/models` has no Cursor entries | Discovery failed for that credential, usually because the sidecar cannot start |
 | `no such file or directory` naming `node` | `node-path` is not resolvable from the host's PATH; set an absolute path (see the [install guide](../README.md#install-auth-cursor)) |
 | `cursor upstream error 401: Invalid User API Key` | The key is rejected; the host then parks the credential, so later requests report `auth_unavailable` instead of repeating the 401 |
-| First request hangs for a minute | The one-time sidecar bootstrap is running `npm install`; check the logs for `installing cursor sidecar dependencies` |
+| `--cursor-login` or first start sits on `installing cursor sidecar dependencies` | Normal: first use after install/upgrade runs `npm install` for `@cursor/sdk` (up to ~1 minute). Wait; later runs reuse `~/.cli-proxy-api/auth-cursor-sidecar/<version>/`. |
 
 ## Development
 

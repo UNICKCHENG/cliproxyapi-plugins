@@ -30,15 +30,17 @@ Configuration details, model behaviour, and troubleshooting live in
 ### Sidecar bootstrap (automatic, but Node is required)
 
 The store installs only the dynamic library (`auth-cursor.dylib` / `.so` / `.dll`). Sidecar
-scripts are embedded in that library. On the **first request** after an install or upgrade the
-plugin:
+scripts are embedded in that library. On the **first use** after an install or upgrade —
+`--cursor-login`, the first server start, or the first request — the plugin:
 
 1. writes the scripts into `~/.cli-proxy-api/auth-cursor-sidecar/<version>/`;
 2. runs `npm install --omit=dev` there once to fetch `@cursor/sdk`.
 
 You do **not** need to copy sidecar files or run `npm install` yourself, and you can leave
-`sidecar-path` empty. You **do** need Node and npm on the machine, and the first request
-needs network access to the npm registry, so it is slower than later ones.
+`sidecar-path` empty. You **do** need Node and npm on the machine, and that first use
+needs network access to the npm registry. Expect it to sit on
+`installing cursor sidecar dependencies` for up to a minute; later runs reuse the same
+directory.
 
 ### Steps
 
@@ -49,7 +51,7 @@ Store source URLs must be `https`; the host rejects `http` and `file` URLs.
 ```yaml
 plugins:
   enabled: true
-  dir: "plugins"          # use an absolute path under launchd or systemd
+  dir: "plugins"          # Homebrew/launchd/systemd: use an absolute writable path, not "plugins" or "~"
   store-sources:
     - "https://raw.githubusercontent.com/UNICKCHENG/cliproxyapi-plugins/main/registry.json"
   configs:
@@ -122,6 +124,10 @@ when the service PATH does not expose it.
 ./cli-proxy-api --cursor-login --no-browser # prints the URL instead
 ```
 
+The first run after an install or upgrade may pause for up to a minute on
+`installing cursor sidecar dependencies` while `npm install` fetches `@cursor/sdk`. Wait
+for that to finish; the browser URL is printed afterwards. Later logins skip this step.
+
 This mints a user API key and writes `cursor-<account>.json` into `auth-dir`, then exits
 without starting the server. Re-running it later renews the key and keeps the settings you
 added to that file. See [auth-cursor/README.md](auth-cursor/README.md#credentials) for
@@ -136,8 +142,9 @@ curl -H "Authorization: Bearer $API_KEY" localhost:8317/v1/chat/completions \
   -d '{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-The first `/v1/models` or chat request after an install may take up to a minute while the
-sidecar bootstraps and runs `npm install`. Later requests reuse
+If `--cursor-login` already finished the sidecar bootstrap, these requests are fast.
+Otherwise the first `/v1/models` or chat request after an install may take up to a minute
+while `npm install` runs. Later requests reuse
 `~/.cli-proxy-api/auth-cursor-sidecar/<version>/`.
 
 ### Common install issues
@@ -146,9 +153,10 @@ sidecar bootstraps and runs `npm install`. Later requests reuse
 | --- | --- |
 | Plugin missing from `/v0/management/plugins` | `plugins.enabled` is off, or `plugins.dir` does not resolve |
 | `"registered": false` | The library failed to load; the binary may lack CGO plugin support |
+| `create plugin directory: mkdir plugins: read-only file system` (or `mkdir ~: …`) | Relative `plugins.dir` (`"plugins"`) or a literal `~` is resolved against the service CWD, often `/` under Homebrew `brew services` / launchd. Set an absolute writable path such as `/Users/<you>/.cli-proxy-api/plugins` and restart. Same class of bug: [CLIProxyAPI #4313](https://github.com/router-for-me/CLIProxyAPI/issues/4313). |
 | `no such file or directory` naming `node` | Set an absolute `node-path` (step 5) |
 | `/v1/models` has no Cursor entries | Sidecar failed to start — usually a missing or wrong `node-path` |
-| First request hangs ~1 minute | Normal: sidecar bootstrap is running `npm install` |
+| `--cursor-login` or first start sits on `installing cursor sidecar dependencies` | Normal: first use after install/upgrade runs `npm install` for `@cursor/sdk` (up to ~1 minute, needs npm registry access). Wait for `cursor sidecar dependencies installed`. Later runs reuse `~/.cli-proxy-api/auth-cursor-sidecar/<version>/`. |
 
 More detail: [auth-cursor/README.md — Troubleshooting](auth-cursor/README.md#troubleshooting).
 

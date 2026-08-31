@@ -14,6 +14,9 @@ routing:
 
 plugins:
   enabled: true
+  # Relative "plugins" and "~" fail under brew services / launchd (CWD is often
+  # "/", which is read-only). Use an absolute writable path instead:
+  # dir: "/Users/<you>/.cli-proxy-api/plugins"
   dir: "plugins"
   # Plugin store source for this plugin. Drop it if you install from source.
   store-sources:
