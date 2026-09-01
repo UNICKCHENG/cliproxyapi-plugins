@@ -26,9 +26,13 @@ func executorRequest(t *testing.T, apiKey string, payload map[string]any) []byte
 	if errPayload != nil {
 		t.Fatalf("marshal payload: %v", errPayload)
 	}
+	model := "fake-model"
+	if named, ok := payload["model"].(string); ok && strings.TrimSpace(named) != "" {
+		model = named
+	}
 	raw, errMarshal := json.Marshal(rpcExecutorRequest{
 		ExecutorRequest: pluginapi.ExecutorRequest{
-			Model:       "fake-model",
+			Model:       model,
 			Payload:     rawPayload,
 			StorageJSON: storageJSON(apiKey),
 		},
@@ -89,8 +93,8 @@ func TestExecuteAssemblesCompletion(t *testing.T) {
 	}
 }
 
-// Every request creates a throwaway agent, so both teardown calls have to happen: CloseAgent
-// releases the local resources and DeleteAgent removes the durable row the bridge wrote for it.
+// A successful text-only run keeps the agent so the next turn can reuse it. Eviction is what
+// issues CloseAgent and DeleteAgent, so the durable row does not accumulate forever.
 func TestExecuteReleasesAndDeletesTheAgent(t *testing.T) {
 	bridge := useFakeBridge(t)
 
@@ -99,8 +103,13 @@ func TestExecuteReleasesAndDeletesTheAgent(t *testing.T) {
 	})); errExecute != nil {
 		t.Fatalf("execute: %v", errExecute)
 	}
+	if got := bridge.closedAgents(); len(got) != 0 {
+		t.Errorf("closed agents = %v, want the agent kept for reuse", got)
+	}
+
+	evictAllSessions()
 	if got := bridge.closedAgents(); len(got) != 1 || got[0] != "agent-1" {
-		t.Errorf("closed agents = %v, want [agent-1]", got)
+		t.Errorf("closed agents = %v, want [agent-1] after eviction", got)
 	}
 	if got := bridge.deletedAgents(); len(got) != 1 || got[0] != "agent-1" {
 		t.Errorf("deleted agents = %v, want [agent-1] so bridge state does not accumulate", got)
@@ -395,9 +404,10 @@ func TestRunFailureClassification(t *testing.T) {
 			wantType:   "invalid_request_error",
 		},
 		{
-			name:       "unrecognised failure stays unclassified",
+			name:       "unrecognised failure is request-scoped",
 			message:    "cursor run failed",
-			wantStatus: 0,
+			wantStatus: http.StatusBadRequest,
+			wantType:   "invalid_request_error",
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -840,10 +850,10 @@ func assertHiddenModel(t *testing.T, models []pluginapi.ModelInfo, id string) {
 // A local agent rejects a remote image reference, so the plugin has to fetch it and send the bytes.
 func TestBuildSdkImagesInlinesRemoteReferences(t *testing.T) {
 	fetched := ""
-	images, errBuild := buildSdkImages([]chatImage{
+	images, errBuild := buildSdkImages(context.Background(), []chatImage{
 		{Data: base64.StdEncoding.EncodeToString([]byte("inline")), MimeType: "image/jpeg"},
 		{URL: "https://example.com/a.png"},
-	}, func(reference string) (string, string, error) {
+	}, func(_ context.Context, reference string) (string, string, error) {
 		fetched = reference
 		return base64.StdEncoding.EncodeToString([]byte("downloaded")), "image/png", nil
 	})
@@ -877,8 +887,8 @@ func TestBuildSdkImagesInlinesRemoteReferences(t *testing.T) {
 // An unfetchable image is the caller's problem, so it must fail the request rather than the
 // credential.
 func TestBuildSdkImagesReportsAFetchFailureAsARequestFault(t *testing.T) {
-	_, errBuild := buildSdkImages([]chatImage{{URL: "https://example.com/gone.png"}},
-		func(string) (string, string, error) { return "", "", errors.New("404") })
+	_, errBuild := buildSdkImages(context.Background(), []chatImage{{URL: "https://example.com/gone.png"}},
+		func(context.Context, string) (string, string, error) { return "", "", errors.New("404") })
 	if errBuild == nil {
 		t.Fatal("expected a fetch failure to be reported")
 	}

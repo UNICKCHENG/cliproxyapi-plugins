@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ const requestLogErrorLimit = 300
 // channel's. Host usage statistics are unaffected: they are reported through the executor
 // adapter with the provider key and the selected credential.
 type requestLogContext struct {
+	ctx          context.Context
 	authID       string
 	authProvider string
 	authLabel    string
@@ -40,8 +42,9 @@ type requestLogOutcome struct {
 
 // newRequestLogContext starts timing a request. The model is passed separately because the host
 // leaves ExecutorRequest.Model empty when the client named the model only in the payload.
-func newRequestLogContext(req pluginapi.ExecutorRequest, model string) requestLogContext {
+func newRequestLogContext(ctx context.Context, req pluginapi.ExecutorRequest, model string) requestLogContext {
 	return requestLogContext{
+		ctx:          ctx,
 		authID:       strings.TrimSpace(req.AuthID),
 		authProvider: strings.TrimSpace(req.AuthProvider),
 		authLabel:    authLabel(req.StorageJSON, req.AuthID),
@@ -61,14 +64,14 @@ func (c *requestLogContext) markFirstDelta() {
 }
 
 func (c *requestLogContext) completed(usage *sdkv1.TokenUsage) {
-	hostLog("info", "cursor request completed", requestLogFields(*c, requestLogOutcome{
+	hostLogContext(c.ctx, "info", "cursor request completed", requestLogFields(*c, requestLogOutcome{
 		latency: time.Since(c.started),
 		usage:   usage,
 	}))
 }
 
 func (c *requestLogContext) failed(message string) {
-	hostLog("warn", "cursor request failed", requestLogFields(*c, requestLogOutcome{
+	hostLogContext(c.ctx, "warn", "cursor request failed", requestLogFields(*c, requestLogOutcome{
 		latency: time.Since(c.started),
 		err:     message,
 	}))

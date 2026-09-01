@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -34,6 +36,8 @@ type fakeBridge struct {
 
 	mu           sync.Mutex
 	created      []*sdkv1.AgentOptions
+	agentByID    map[string]*sdkv1.AgentOptions
+	agentSeq     int
 	closed       []string
 	deleted      []string
 	cancelled    []string
@@ -46,6 +50,25 @@ type fakeBridge struct {
 	// at which a cancellation has something to cancel.
 	announced     chan struct{}
 	announcedOnce sync.Once
+
+	callbackURL   string
+	callbackToken string
+	toolRounds    []fakeToolRound
+	toolResults   []*sdkv1.CallCustomToolResponse
+	inFlightTools int
+	sendPrompts   []string
+}
+
+type fakeToolCall struct {
+	Name string
+	Args map[string]any
+}
+
+type fakeToolRound struct {
+	Deltas     []string
+	Calls      []fakeToolCall
+	ExtraGate  <-chan struct{}
+	ExtraCalls []fakeToolCall
 }
 
 func newFakeBridge() *fakeBridge {
@@ -101,8 +124,12 @@ func (f *fakeBridge) Ping(context.Context, *connect.Request[sdkv1.PingRequest]) 
 	return connect.NewResponse(&sdkv1.PingResponse{Message: "ok"}), nil
 }
 
-func (f *fakeBridge) Shutdown(context.Context, *connect.Request[sdkv1.ShutdownRequest]) (*connect.Response[sdkv1.ShutdownResponse], error) {
-	return connect.NewResponse(&sdkv1.ShutdownResponse{}), nil
+func (f *fakeBridge) SetToolCallback(_ context.Context, req *connect.Request[sdkv1.SetToolCallbackRequest]) (*connect.Response[sdkv1.SetToolCallbackResponse], error) {
+	f.mu.Lock()
+	f.callbackURL = req.Msg.GetUrl()
+	f.callbackToken = req.Msg.GetAuthToken()
+	f.mu.Unlock()
+	return connect.NewResponse(&sdkv1.SetToolCallbackResponse{}), nil
 }
 
 func (f *fakeBridge) Me(_ context.Context, req *connect.Request[sdkv1.MeRequest]) (*connect.Response[sdkv1.MeResponse], error) {
@@ -157,9 +184,15 @@ func (f *fakeBridge) CreateAgent(_ context.Context, req *connect.Request[sdkv1.C
 		return nil, errKey
 	}
 	f.mu.Lock()
+	f.agentSeq++
+	id := fmt.Sprintf("agent-%d", f.agentSeq)
 	f.created = append(f.created, options)
+	if f.agentByID == nil {
+		f.agentByID = make(map[string]*sdkv1.AgentOptions)
+	}
+	f.agentByID[id] = options
 	f.mu.Unlock()
-	return connect.NewResponse(&sdkv1.CreateAgentResponse{AgentId: "agent-1", Model: options.GetModel()}), nil
+	return connect.NewResponse(&sdkv1.CreateAgentResponse{AgentId: id, Model: options.GetModel()}), nil
 }
 
 func (f *fakeBridge) CloseAgent(_ context.Context, req *connect.Request[sdkv1.CloseAgentRequest]) (*connect.Response[sdkv1.CloseAgentResponse], error) {
@@ -196,17 +229,20 @@ func (f *fakeBridge) CancelRun(_ context.Context, req *connect.Request[sdkv1.Can
 // Send streams one run. The event order mirrors a live bridge stream: conversation messages, then
 // opt-in deltas, then the terminal result and the end-of-stream marker, with a keepalive mixed in.
 func (f *fakeBridge) Send(ctx context.Context, req *connect.Request[sdkv1.SendRequest], stream *connect.ServerStream[sdkv1.RunStreamMessage]) error {
-	apiKey := fakeBridgeSendKey(f, req.Msg.GetAgentId())
+	agentID := req.Msg.GetAgentId()
+	apiKey := fakeBridgeSendKey(f, agentID)
 	f.mu.Lock()
 	f.sendAPIKeys = append(f.sendAPIKeys, apiKey)
 	f.enableDeltas = append(f.enableDeltas, req.Msg.GetOptions().GetEnableDeltas())
+	f.sendPrompts = append(f.sendPrompts, req.Msg.GetMessage().GetText())
 	hold := f.hold
+	customTools := len(f.agentByID[agentID].GetLocal().GetCustomTools()) > 0
 	f.mu.Unlock()
 
 	if errSend := stream.Send(&sdkv1.RunStreamMessage{
 		Envelope: &sdkv1.RunStreamMessage_SdkMessage{SdkMessage: &sdkv1.SdkMessage{
 			Type:    "system",
-			Message: mustStruct(map[string]any{"subtype": "init", "run_id": "run-1", "agent_id": "agent-1"}),
+			Message: mustStruct(map[string]any{"subtype": "init", "run_id": "run-1", "agent_id": agentID}),
 		}},
 	}); errSend != nil {
 		return errSend
@@ -249,31 +285,131 @@ func (f *fakeBridge) Send(ctx context.Context, req *connect.Request[sdkv1.SendRe
 		}
 		return stream.Send(&sdkv1.RunStreamMessage{
 			Envelope: &sdkv1.RunStreamMessage_Result{Result: &sdkv1.RunStreamResult{
-				AgentId: "agent-1",
+				AgentId: agentID,
 				RunId:   "run-1",
 				Status:  sdkv1.RunLifecycleStatus_RUN_LIFECYCLE_STATUS_ERROR,
 			}},
 		})
 	}
 
-	for _, update := range []*sdkv1.RunStreamMessage{
-		textDeltaMessage("Hello"),
-		// An update kind this plugin does not consume must not reach the client.
-		updateMessage("tool-call-delta", "IGNORED"),
-		textDeltaMessage(" world"),
-	} {
+	if customTools {
+		if errTools := f.sendToolRounds(ctx, stream, agentID); errTools != nil {
+			return errTools
+		}
+		return f.sendTerminal(stream, agentID, false)
+	}
+	return f.sendTerminal(stream, agentID, true)
+}
+func (f *fakeBridge) sendToolRounds(ctx context.Context, stream *connect.ServerStream[sdkv1.RunStreamMessage], agentID string) error {
+	f.mu.Lock()
+	url := f.callbackURL
+	token := f.callbackToken
+	rounds := append([]fakeToolRound(nil), f.toolRounds...)
+	f.mu.Unlock()
+	if url == "" {
+		return errors.New("fake bridge has no tool callback URL")
+	}
+	client := sdkv1connect.NewSdkCustomToolCallbackServiceClient(http.DefaultClient, strings.TrimRight(url, "/"))
+	for _, round := range rounds {
+		if errRound := f.sendOneToolRound(ctx, stream, client, token, agentID, round); errRound != nil {
+			return errRound
+		}
+	}
+	return nil
+}
+
+func (f *fakeBridge) sendOneToolRound(ctx context.Context, stream *connect.ServerStream[sdkv1.RunStreamMessage], client sdkv1connect.SdkCustomToolCallbackServiceClient, token, agentID string, round fakeToolRound) error {
+	var wg sync.WaitGroup
+	errCh := make(chan error, len(round.Calls)+len(round.ExtraCalls)+1)
+	start := func(call fakeToolCall) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errCh <- f.callCustomTool(ctx, client, token, agentID, call)
+		}()
+	}
+	for _, call := range round.Calls {
+		start(call)
+	}
+	if round.ExtraGate != nil && len(round.ExtraCalls) > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case <-round.ExtraGate:
+			case <-ctx.Done():
+				errCh <- ctx.Err()
+				return
+			}
+			var extraWG sync.WaitGroup
+			for _, call := range round.ExtraCalls {
+				call := call
+				extraWG.Add(1)
+				go func() {
+					defer extraWG.Done()
+					errCh <- f.callCustomTool(ctx, client, token, agentID, call)
+				}()
+			}
+			extraWG.Wait()
+		}()
+	}
+	for _, delta := range round.Deltas {
+		if errSend := stream.Send(textDeltaMessage(delta)); errSend != nil {
+			return errSend
+		}
+	}
+	wg.Wait()
+	close(errCh)
+	for errCall := range errCh {
+		if errCall != nil {
+			return errCall
+		}
+	}
+	return nil
+}
+
+func (f *fakeBridge) callCustomTool(_ context.Context, client sdkv1connect.SdkCustomToolCallbackServiceClient, token, agentID string, call fakeToolCall) error {
+	request := connect.NewRequest(&sdkv1.CallCustomToolRequest{
+		ToolName: call.Name,
+		AgentId:  agentID,
+	})
+	if call.Args != nil {
+		request.Msg.Args = mustStruct(call.Args)
+	}
+	request.Header().Set("Authorization", "Bearer "+token)
+	f.mu.Lock()
+	f.inFlightTools++
+	f.mu.Unlock()
+	// The callback RPC is independent of the Send stream context: aborting a parked run
+	// must still deliver the isError result to the bridge.
+	response, errCall := client.CallCustomTool(context.Background(), request)
+	f.mu.Lock()
+	f.inFlightTools--
+	if errCall == nil && response != nil {
+		f.toolResults = append(f.toolResults, response.Msg)
+	}
+	f.mu.Unlock()
+	return errCall
+}
+
+func (f *fakeBridge) sendTerminal(stream *connect.ServerStream[sdkv1.RunStreamMessage], agentID string, includeIgnoredDelta bool) error {
+	updates := []*sdkv1.RunStreamMessage{textDeltaMessage("Hello")}
+	if includeIgnoredDelta {
+		updates = append(updates, updateMessage("tool-call-delta", "IGNORED"))
+	}
+	updates = append(updates, textDeltaMessage(" world"))
+	for _, update := range updates {
 		if errSend := stream.Send(update); errSend != nil {
 			return errSend
 		}
 	}
-
 	status := sdkv1.RunLifecycleStatus_RUN_LIFECYCLE_STATUS_FINISHED
 	if len(f.cancelledRuns()) > 0 {
 		status = sdkv1.RunLifecycleStatus_RUN_LIFECYCLE_STATUS_CANCELLED
 	}
 	if errSend := stream.Send(&sdkv1.RunStreamMessage{
 		Envelope: &sdkv1.RunStreamMessage_Result{Result: &sdkv1.RunStreamResult{
-			AgentId: "agent-1",
+			AgentId: agentID,
 			RunId:   "run-1",
 			Status:  status,
 			Result: &sdkv1.RunResult{
@@ -291,7 +427,7 @@ func (f *fakeBridge) Send(ctx context.Context, req *connect.Request[sdkv1.SendRe
 		return errSend
 	}
 	return stream.Send(&sdkv1.RunStreamMessage{
-		Envelope: &sdkv1.RunStreamMessage_Done{Done: &sdkv1.RunStreamDone{AgentId: "agent-1", RunId: "run-1"}},
+		Envelope: &sdkv1.RunStreamMessage_Done{Done: &sdkv1.RunStreamDone{AgentId: agentID, RunId: "run-1"}},
 	})
 }
 
@@ -332,11 +468,32 @@ func (f *fakeBridge) deletedAgents() []string {
 	return append([]string(nil), f.deleted...)
 }
 
+func (f *fakeBridge) inflightToolCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.inFlightTools
+}
+
+func (f *fakeBridge) recordedToolResults() []*sdkv1.CallCustomToolResponse {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]*sdkv1.CallCustomToolResponse(nil), f.toolResults...)
+}
+
+func (f *fakeBridge) recordedPrompts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.sendPrompts...)
+}
+
 // fakeBridgeSendKey recovers the credential a Send belongs to. SendRequest carries no key, so the
 // fake looks it up from the agent it was created with, exactly as a real bridge would.
 func fakeBridgeSendKey(f *fakeBridge, agentID string) string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if options, ok := f.agentByID[agentID]; ok {
+		return options.GetApiKey()
+	}
 	if agentID == "" || len(f.created) == 0 {
 		return ""
 	}
@@ -423,6 +580,9 @@ func useFakeBridgeService(t *testing.T, bridge *fakeBridge) {
 	}); errBind != nil {
 		t.Fatalf("bind fake bridge clients: %v", errBind)
 	}
+	if errCallback := startToolCallback(process); errCallback != nil {
+		t.Fatalf("start tool callback: %v", errCallback)
+	}
 
 	bridgePool.mu.Lock()
 	previous := bridgePool.procs
@@ -432,6 +592,9 @@ func useFakeBridgeService(t *testing.T, bridge *fakeBridge) {
 	currentConfig.Store(defaultPluginConfig())
 	resetModelCatalogs()
 	t.Cleanup(func() {
+		failToolRunsForProcess(process)
+		evictSessionsForProcess(process)
+		stopToolCallback(process)
 		bridgePool.mu.Lock()
 		bridgePool.procs = previous
 		bridgePool.mu.Unlock()

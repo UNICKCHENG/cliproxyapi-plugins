@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 	"time"
 
@@ -22,37 +23,82 @@ const agentCleanupTimeout = 15 * time.Second
 
 // generateRequest is one inference request, already resolved down to what the bridge needs.
 type generateRequest struct {
-	apiKey      string
-	proxyURL    string
-	model       string
-	params      []modelParam
-	optimizeFor string
-	prompt      string
-	images      []chatImage
+	apiKey           string
+	proxyURL         string
+	model            string
+	params           []modelParam
+	optimizeFor      string
+	prompt           string
+	images           []chatImage
+	tools            map[string]*sdkv1.CustomToolDefinition
+	toolResults      []chatToolResult
+	sessionPrefix    string
+	sessionIncrement string
+	incrementImages  []chatImage
 }
 
-// generateResult is the outcome of a completed run.
+// generateResult is the outcome of a completed run or one parked tool-call turn.
 type generateResult struct {
-	text  string
-	usage *sdkv1.TokenUsage
+	text      string
+	usage     *sdkv1.TokenUsage
+	toolCalls []chatToolCall
 }
 
-// runGenerate drives one throwaway local agent through a single turn.
+// runGenerate drives a local agent through one HTTP turn.
 //
-// The agent is created, sent one message and torn down per request: the plugin exposes a
-// stateless model API, so there is no conversation to keep alive between calls. onDelta is
-// optional; when it is nil the bridge is not asked for deltas and the final text comes from the
-// terminal result. Returning an error from onDelta aborts the run.
+// Text-only requests reuse a live agent when the conversation prefix matches; otherwise they
+// create one and keep it for the next turn. Tool-enabled requests keep the agent and Send stream
+// alive across HTTP turns: CallCustomTool is parked until the next request delivers role:tool
+// results. onDelta is optional; when it is nil a text-only run does not ask for deltas.
+// Tool-enabled runs always enable deltas so text before a tool call is captured. Returning an
+// error from onDelta aborts the run.
 //
 // No deadline is applied: once the run is live upstream, the plugin must not impose its own
 // timeout on the response.
 func runGenerate(ctx context.Context, req generateRequest, onDelta func(string) error) (generateResult, error) {
+	if len(req.toolResults) > 0 {
+		result, resumed, errResume := resumeToolRun(ctx, req, onDelta)
+		if resumed {
+			return result, errResume
+		}
+	}
+	if len(req.tools) == 0 {
+		return runOneShot(ctx, req, onDelta)
+	}
+	return startToolRun(ctx, req, onDelta)
+}
+
+func runOneShot(ctx context.Context, req generateRequest, onDelta func(string) error) (generateResult, error) {
 	process, errProcess := acquireBridge(req.proxyURL)
 	if errProcess != nil {
 		return generateResult{}, errProcess
 	}
 
-	images, errImages := buildSdkImages(req.images, downloadImage)
+	if entry, increment, incrementImages, ok := occupySession(req); ok {
+		if errBudget := checkPromptBudget(increment); errBudget != nil {
+			releaseSession(entry, true)
+			return generateResult{}, errBudget
+		}
+		images, errImages := buildSdkImages(ctx, incrementImages, downloadImage)
+		if errImages != nil {
+			releaseSession(entry, false)
+			return generateResult{}, errImages
+		}
+		incrementReq := req
+		incrementReq.prompt = increment
+		result, errSend := sendAndConsume(ctx, entry.process, entry.agentID, incrementReq, images, onDelta)
+		if errSend != nil {
+			releaseSession(entry, false)
+			return generateResult{}, errSend
+		}
+		rekeySession(entry, req, result.text)
+		return result, nil
+	}
+
+	if errBudget := checkPromptBudget(req.prompt); errBudget != nil {
+		return generateResult{}, errBudget
+	}
+	images, errImages := buildSdkImages(ctx, req.images, downloadImage)
 	if errImages != nil {
 		return generateResult{}, errImages
 	}
@@ -61,18 +107,42 @@ func runGenerate(ctx context.Context, req generateRequest, onDelta func(string) 
 	if errCreate != nil {
 		return generateResult{}, errCreate
 	}
-	// CloseAgent releases local resources; DeleteAgent removes the durable state the bridge
-	// writes for every agent. Without the delete, one row per request accumulates forever in the
-	// bridge's local store.
-	defer releaseAgent(process, agentID, req.apiKey)
+	result, errRun := sendAndConsume(ctx, process, agentID, req, images, onDelta)
+	if errRun != nil {
+		releaseAgent(process, agentID, req.apiKey)
+		return generateResult{}, errRun
+	}
+	if !rememberSession(req, process, agentID, result.text) {
+		releaseAgent(process, agentID, req.apiKey)
+	}
+	return result, nil
+}
 
+func sendAndConsume(ctx context.Context, process *bridgeProcess, agentID string, req generateRequest, images []*sdkv1.SdkImage, onDelta func(string) error) (generateResult, error) {
 	stream, errSend := openSend(ctx, process, agentID, req, images, onDelta != nil)
+	if errSend != nil && isAgentNotFound(errSend) {
+		if errResume := resumeParkedAgent(ctx, process, agentID, req); errResume == nil {
+			stream, errSend = openSend(ctx, process, agentID, req, images, onDelta != nil)
+		}
+	}
 	if errSend != nil {
 		return generateResult{}, errSend
 	}
 	defer stream.Close()
-
 	return consumeRunStream(process, agentID, stream, onDelta)
+}
+
+// promptMaxRunes is a conservative cap on the text handed to a single Send. The Agent harness
+// adds its own system prompt and tool schema on top, and sdk.v1 exposes no context-window field
+// to read, so this is a request-scoped guard rather than a model-accurate budget.
+var promptMaxRunes = 80 * 1024
+
+func checkPromptBudget(prompt string) error {
+	if len([]rune(prompt)) <= promptMaxRunes {
+		return nil
+	}
+	return &upstreamError{failure: requestFault("context_length_exceeded",
+		"cursor prompt exceeds the plugin's send budget; shorten the conversation or switch to a native channel")}
 }
 
 func createAgent(ctx context.Context, process *bridgeProcess, req generateRequest) (string, error) {
@@ -92,11 +162,8 @@ func createAgent(ctx context.Context, process *bridgeProcess, req generateReques
 			// The key is set per call rather than in the bridge environment: one bridge serves
 			// every credential that shares its proxy.
 			ApiKey: req.apiKey,
-			Local:  &sdkv1.LocalAgentOptions{Cwd: []string{process.workspace}},
-			// An empty ToolList means no built-in tools, which an unset field would not: the
-			// agent may only answer with text, so shell, edit and search tools are meaningless
-			// and would let a model proxy request touch the host.
-			Tools: &sdkv1.ToolList{},
+			Local:  localAgentOptions(process, req.tools),
+			Tools:  agentToolList(req.tools),
 		},
 	}))
 	if errCreate != nil {
@@ -109,12 +176,50 @@ func createAgent(ctx context.Context, process *bridgeProcess, req generateReques
 	return agentID, nil
 }
 
+func localAgentOptions(process *bridgeProcess, tools map[string]*sdkv1.CustomToolDefinition) *sdkv1.LocalAgentOptions {
+	local := &sdkv1.LocalAgentOptions{Cwd: []string{process.workspace}}
+	if len(tools) > 0 {
+		local.CustomTools = maps.Clone(tools)
+	}
+	return local
+}
+
+// agentToolList keeps Cursor built-ins (shell, edit, search) off. An empty list is required
+// for text-only runs: an unset Tools field would load the default toolset against the host.
+// Custom tools are registered as the MCP server "custom-user-tools", so a tool-enabled run
+// must allowlist the "mcp" capability group or the agent reports a tool-discovery failure.
+func agentToolList(tools map[string]*sdkv1.CustomToolDefinition) *sdkv1.ToolList {
+	if len(tools) == 0 {
+		return &sdkv1.ToolList{}
+	}
+	return &sdkv1.ToolList{Names: []string{"mcp"}}
+}
+
 func openSend(ctx context.Context, process *bridgeProcess, agentID string, req generateRequest, images []*sdkv1.SdkImage, deltas bool) (*connect.ServerStreamForClient[sdkv1.RunStreamMessage], error) {
 	return process.agent.Send(ctx, connect.NewRequest(&sdkv1.SendRequest{
 		AgentId: agentID,
 		Message: &sdkv1.UserMessage{Text: req.prompt, Images: images},
 		Options: &sdkv1.SendOptions{EnableDeltas: deltas},
 	}))
+}
+
+func resumeParkedAgent(ctx context.Context, process *bridgeProcess, agentID string, req generateRequest) error {
+	models, _ := catalogFor(ctx, process, req.apiKey, false)
+	_, errResume := process.agent.ResumeAgent(ctx, connect.NewRequest(&sdkv1.ResumeAgentRequest{
+		AgentId: agentID,
+		Options: &sdkv1.AgentOptions{
+			Model:  resolveModelSelection(models, req.model, req.params, req.optimizeFor),
+			ApiKey: req.apiKey,
+			Local:  localAgentOptions(process, req.tools),
+			Tools:  agentToolList(req.tools),
+		},
+	}))
+	return errResume
+}
+
+func isAgentNotFound(err error) bool {
+	details, ok := sdkErrorDetails(err)
+	return ok && details.GetSdkErrorCode() == sdkv1.SdkErrorCode_SDK_ERROR_CODE_AGENT_NOT_FOUND
 }
 
 // consumeRunStream reads a Send stream to its terminal result.
@@ -180,7 +285,7 @@ func consumeRunStream(
 		return generateResult{}, errors.New("cursor sdk bridge closed the run stream before it completed")
 	}
 	if result.GetStatus() != sdkv1.RunLifecycleStatus_RUN_LIFECYCLE_STATUS_FINISHED {
-		return generateResult{}, &upstreamError{failure: runFailure(runFailureMessage(result, statusMessage))}
+		return generateResult{}, &upstreamError{failure: runFailureFromResult(result, statusMessage)}
 	}
 	final := result.GetResult().GetResult()
 	if final == "" {

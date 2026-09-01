@@ -101,7 +101,9 @@ func parseEgressProxy(proxy string) (*url.URL, error) {
 // the whole bridge process when its backend URL matches "localhost" or "127.0.0.1" literally.
 // That would weaken the connections the bridge still makes directly, and there is no reason to
 // accept it just to reach a listener on the same machine.
-var egressListenAddrs = []string{"[::1]:0", "127.0.0.1:0"}
+var egressListenAddrs = []string{"[::1]:0", "127.0.0.2:0"}
+
+var toolCallbackListenAddrs = []string{"[::1]:0", "127.0.0.1:0"}
 
 func listenEgress() (net.Listener, error) {
 	var first error
@@ -135,10 +137,9 @@ func startBridgeEgress(proxyURL string) (*bridgeEgress, error) {
 		return nil, errListen
 	}
 	address := listener.Addr().String()
-	if !strings.HasPrefix(address, "[") {
-		hostLog("warn", "cursor egress bound to the IPv4 loopback", map[string]any{
-			"detail": "the bridge disables TLS certificate verification for its own direct connections when its backend URL is 127.0.0.1, and the IPv6 loopback was unavailable",
-		})
+	if strings.Contains(address, "127.0.0.1") {
+		_ = listener.Close()
+		return nil, fmt.Errorf("cursor egress refused to bind 127.0.0.1 because the bridge disables TLS verification for that backend URL")
 	}
 
 	server := &http.Server{

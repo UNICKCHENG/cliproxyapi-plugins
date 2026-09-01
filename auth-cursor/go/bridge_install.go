@@ -30,6 +30,10 @@ const bridgeDirName = "auth-cursor-bridge"
 // bridge, and the limit keeps a decompression bomb from filling the cache directory.
 const bridgeArchiveMaxBytes = 512 << 20
 
+// bridgeDownloadMaxBytes bounds the compressed archive fetch. The pinned archives are tens of
+// megabytes; this is enough headroom without letting a hostile endpoint fill the disk.
+const bridgeDownloadMaxBytes = 256 << 20
+
 // bridgeDownloadTimeout bounds the archive fetch. A timeout is acceptable here because this is
 // installation, not an established upstream call.
 const bridgeDownloadTimeout = 15 * time.Minute
@@ -51,10 +55,24 @@ func resolveBridgeBinary(cfg pluginConfig) (string, error) {
 		return "", errRoot
 	}
 	installed := filepath.Join(root, "bin", bridgeExecutableName())
+	errVerify := error(nil)
 	if fileExists(installed) {
-		return installed, nil
+		if errVerify = verifyInstalledBridge(root); errVerify == nil {
+			return installed, nil
+		}
 	}
 	if errInstall := installBridge(cfg, root); errInstall != nil {
+		// An install that cannot run leaves the provider with nothing, so an existing tree is
+		// still used rather than failing every request. It is reported at warn because the copy
+		// on disk is the unverified one the reinstall was meant to replace.
+		if fileExists(installed) {
+			hostLog("warn", "cursor sdk bridge reinstall failed, using the existing unverified install", map[string]any{
+				"path":   installed,
+				"reason": errInstall.Error(),
+				"verify": errorText(errVerify),
+			})
+			return installed, nil
+		}
 		return "", errInstall
 	}
 	if !fileExists(installed) {
@@ -137,13 +155,31 @@ func installBridge(cfg pluginConfig, root string) error {
 	if errExtract := extractTarGz(archive, unpacked); errExtract != nil {
 		return fmt.Errorf("unpack %s: %w", archiveURL, errExtract)
 	}
+	// A pre-existing tree has to be moved out of the way first: renaming onto a non-empty
+	// directory fails, and the old binary must not inherit the stamp written for this download.
+	replaced := ""
+	if _, errStat := os.Stat(root); errStat == nil {
+		replaced = root + ".replaced-" + fmt.Sprint(os.Getpid())
+		if errAside := os.Rename(root, replaced); errAside != nil {
+			return fmt.Errorf("replace cursor sdk bridge at %s: %w", root, errAside)
+		}
+	}
 	if errRename := os.Rename(unpacked, root); errRename != nil {
+		if replaced != "" {
+			_ = os.Rename(replaced, root)
+		}
 		// A concurrent install of the same version is the benign case: the destination now
-		// holds a verified tree, which is all the caller needs.
+		// holds a tree another process verified, which is all the caller needs.
 		if fileExists(filepath.Join(root, "bin", bridgeExecutableName())) {
 			return nil
 		}
 		return fmt.Errorf("move cursor sdk bridge into %s: %w", root, errRename)
+	}
+	if replaced != "" {
+		_ = os.RemoveAll(replaced)
+	}
+	if errStamp := stampInstalledBridge(root, platform); errStamp != nil {
+		return errStamp
 	}
 	hostLog("info", "cursor sdk bridge installed", map[string]any{"version": bridgeVersion, "path": root})
 	return nil
@@ -179,8 +215,14 @@ func downloadBridgeArchive(cfg pluginConfig, archiveURL, dir string) (string, er
 		return "", fmt.Errorf("create %s: %w", path, errCreate)
 	}
 	defer file.Close()
-	if _, errCopy := io.Copy(file, resp.Body); errCopy != nil {
+	written, errCopy := io.Copy(file, io.LimitReader(resp.Body, bridgeDownloadMaxBytes+1))
+	if errCopy != nil {
+		_ = os.Remove(path)
 		return "", fmt.Errorf("write %s: %w", path, errCopy)
+	}
+	if written > bridgeDownloadMaxBytes {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("download %s exceeds %d bytes", archiveURL, bridgeDownloadMaxBytes)
 	}
 	return path, nil
 }
@@ -204,6 +246,65 @@ func verifyFileSHA256(path, want string) error {
 		return fmt.Errorf("sha256 mismatch: got %s, want %s", got, want)
 	}
 	return nil
+}
+
+func fileSHA256(path string) (string, error) {
+	file, errOpen := os.Open(path)
+	if errOpen != nil {
+		return "", errOpen
+	}
+	defer file.Close()
+	digest := sha256.New()
+	if _, errCopy := io.Copy(digest, file); errCopy != nil {
+		return "", errCopy
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func stampInstalledBridge(root, platform string) error {
+	archiveSum := strings.ToLower(strings.TrimSpace(bridgeArchiveChecksums[platform]))
+	if archiveSum == "" {
+		return errors.New("no checksum is recorded for this platform")
+	}
+	binary := filepath.Join(root, "bin", bridgeExecutableName())
+	binarySum, errHash := fileSHA256(binary)
+	if errHash != nil {
+		return errHash
+	}
+	if errWrite := os.WriteFile(filepath.Join(root, "archive.sha256"), []byte(archiveSum+"\n"), 0o600); errWrite != nil {
+		return errWrite
+	}
+	if errWrite := os.WriteFile(filepath.Join(root, "bin.sha256"), []byte(binarySum+"\n"), 0o600); errWrite != nil {
+		return errWrite
+	}
+	return nil
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func verifyInstalledBridge(root string) error {
+	platform, errPlatform := bridgePlatform(runtime.GOOS, runtime.GOARCH)
+	if errPlatform != nil {
+		return errPlatform
+	}
+	wantArchive := strings.ToLower(strings.TrimSpace(bridgeArchiveChecksums[platform]))
+	rawArchive, errRead := os.ReadFile(filepath.Join(root, "archive.sha256"))
+	if errRead != nil {
+		return errRead
+	}
+	if strings.TrimSpace(string(rawArchive)) != wantArchive {
+		return fmt.Errorf("installed bridge archive stamp does not match the pinned checksum")
+	}
+	rawBinary, errRead := os.ReadFile(filepath.Join(root, "bin.sha256"))
+	if errRead != nil {
+		return errRead
+	}
+	return verifyFileSHA256(filepath.Join(root, "bin", bridgeExecutableName()), strings.TrimSpace(string(rawBinary)))
 }
 
 // extractTarGz unpacks archive into dir. The bridge archives hold regular files, directories and

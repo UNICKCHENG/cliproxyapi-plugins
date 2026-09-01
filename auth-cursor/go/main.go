@@ -70,6 +70,10 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
+// pluginRequestMaxBytes bounds a C ABI inbound payload. Image data URLs are the large case
+// and are already capped at 24MiB; the extra headroom covers JSON wrapping.
+const pluginRequestMaxBytes = 40 << 20
+
 // providerIdentifier is the provider key shared by the executor, auth provider and models.
 // Auth records must carry this provider for the host scheduler to bind them to the executor.
 const providerIdentifier = "cursor"
@@ -127,6 +131,11 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	var requestBytes []byte
 	if request != nil && requestLen > 0 {
+		if inboundRequestTooLarge(uint64(requestLen)) {
+			writeResponse(response, upstreamErrorEnvelope("request_too_large",
+				fmt.Sprintf("plugin request exceeds %d bytes", pluginRequestMaxBytes), 413, false))
+			return 1
+		}
 		requestBytes = C.GoBytes(unsafe.Pointer(request), C.int(requestLen))
 	}
 	raw, errHandle := handleMethod(C.GoString(method), requestBytes)
@@ -150,6 +159,10 @@ func cliproxyPluginShutdown() {
 	stopBridges()
 }
 
+func inboundRequestTooLarge(n uint64) bool {
+	return n > pluginRequestMaxBytes
+}
+
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
@@ -159,6 +172,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodPluginShutdown:
 		stopBridges()
+		return okEnvelope(struct{}{})
+	case pluginabi.MethodPluginQuiesce:
+		quiesce()
 		return okEnvelope(struct{}{})
 	case pluginabi.MethodAuthIdentifier, pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(map[string]string{"identifier": providerIdentifier})

@@ -253,5 +253,37 @@ func runFailure(message string) upstreamFailure {
 			return requestFault("model_not_available", message)
 		}
 	}
-	return upstreamFailure{Message: message}
+	return requestFault("run_failed", message)
+}
+
+// runFailureFromResult classifies a terminal non-success run. A run that reached this point
+// already authenticated: CreateAgent and Send both succeeded, so the failure is request-scoped
+// unless the result itself carries a credential or quota code.
+func runFailureFromResult(result *sdkv1.RunStreamResult, statusMessage string) upstreamFailure {
+	if details, ok := sdkErrorDetailsFromRun(result, statusMessage); ok {
+		return failureFromDetails(details)
+	}
+	return runFailure(runFailureMessage(result, statusMessage))
+}
+
+func sdkErrorDetailsFromRun(result *sdkv1.RunStreamResult, statusMessage string) (*sdkv1.SdkErrorDetails, bool) {
+	if result == nil {
+		return nil, false
+	}
+	code := strings.TrimSpace(result.GetErrorCode())
+	if code == "" {
+		return nil, false
+	}
+	key := strings.ToUpper(code)
+	if !strings.HasPrefix(key, "SDK_ERROR_CODE_") {
+		key = "SDK_ERROR_CODE_" + key
+	}
+	mapped, ok := sdkv1.SdkErrorCode_value[key]
+	if !ok || mapped == 0 {
+		return nil, false
+	}
+	return &sdkv1.SdkErrorDetails{
+		SdkErrorCode: sdkv1.SdkErrorCode(mapped),
+		Message:      runFailureMessage(result, statusMessage),
+	}, true
 }

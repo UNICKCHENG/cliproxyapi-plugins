@@ -73,7 +73,14 @@ func fakeBridgeExecutable(t *testing.T, discovery bridgeDiscovery, script string
 // current bridge hands it over.
 func authTokenFile(t *testing.T, token string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "token")
+	root, errRoot := bridgeStateRoot()
+	if errRoot != nil {
+		t.Fatalf("bridgeStateRoot: %v", errRoot)
+	}
+	if errMkdir := os.MkdirAll(root, 0o700); errMkdir != nil {
+		t.Fatalf("create state root: %v", errMkdir)
+	}
+	path := filepath.Join(root, "token")
 	if errWrite := os.WriteFile(path, []byte(token+"\n"), 0o600); errWrite != nil {
 		t.Fatalf("write auth token: %v", errWrite)
 	}
@@ -195,6 +202,16 @@ func TestStartBridgeRejectsAnUnsupportedDiscovery(t *testing.T) {
 			discovery: bridgeDiscovery{SchemaVersion: bridgeDiscoverySchema, Transport: "tcp", Protocol: "connect"},
 			want:      "no address",
 		},
+		{
+			name:      "https url",
+			discovery: bridgeDiscovery{SchemaVersion: bridgeDiscoverySchema, Transport: "tcp", Protocol: "connect", URL: "https://127.0.0.1:1"},
+			want:      "must be http",
+		},
+		{
+			name:      "non-loopback host",
+			discovery: bridgeDiscovery{SchemaVersion: bridgeDiscoverySchema, Transport: "tcp", Protocol: "connect", URL: "http://example.com:1"},
+			want:      "loopback",
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			useTempCacheDir(t)
@@ -216,6 +233,7 @@ while true; do sleep 1; done
 
 // An older bridge inlines the token in the discovery line; a current one writes it to a file.
 func TestBridgeAuthTokenAcceptsBothDeliveries(t *testing.T) {
+	useTempCacheDir(t)
 	inline, errInline := bridgeAuthToken(bridgeDiscovery{AuthToken: " token-inline "})
 	if errInline != nil || inline != "token-inline" {
 		t.Errorf("inline token = %q err = %v, want token-inline", inline, errInline)

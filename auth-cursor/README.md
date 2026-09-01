@@ -28,9 +28,10 @@ release, verifies a checksum compiled into the library, and unpacks it into the
 user cache. **No Node.js or npm** — earlier versions ran a Node sidecar; this
 one does not.
 
-Each request creates a one-shot agent with an empty working directory and an
-empty tool list, so the agent can only answer with text. That reduces an agent
-run to plain model inference, which is what a proxy request means.
+Text-only requests reuse a live agent across turns when the credential, model,
+tools and conversation prefix match; a miss creates a new agent. Tools stay off
+unless the client sends them, and the working directory is always empty, so a
+text-only run stays as close to plain inference as the Agent SDK allows.
 
 ```
 client (OpenAI/Claude/Gemini)
@@ -282,17 +283,55 @@ The running plugin must be a build that applies these lists on
 
 - **Agent semantics, not raw inference.** Claude or GPT selections still run
   through the Cursor agent harness and bill the Cursor usage pool.
-- **Stateless.** Every request builds a fresh agent from the full message list.
-- **Latency.** Agent creation adds overhead versus a native inference API.
+- **Agent reuse, not a fresh agent every time.** A text-only conversation that
+  continues from the last assistant turn is sent as an increment on the same
+  `agent_id`. A different credential, model, tool set, or an edited history
+  misses the cache and starts a new agent. Concurrent requests with the same
+  key also miss (one agent can only run one run). A failed or cancelled turn
+  discards that agent. If reuse cannot be proven, the plugin falls back to
+  flattening the full message list into one user prompt — that is larger than
+  the same dialogue on a native API, and an over-budget send returns **400**
+  `context_length_exceeded` without cooling the credential.
+- **Custom tools need an mcp allowlist.** Client `tools` are registered as
+  `local.custom_tools` and the agent is created with `Tools.names = ["mcp"]`.
+  An older library that still sends an empty `ToolList` for tool-enabled
+  requests will fail tool discovery inside the run. Overwrite the versioned
+  filename the host actually loads (see Development); the store name
+  `auth-cursor.dylib` is not always the file in memory.
+- **Latency.** Agent creation adds overhead versus a native inference API; reuse
+  removes that cost on later turns of the same conversation.
 - **A cancelled request cancels the run.** Dropping the stream does not stop
   Cursor; the plugin issues an explicit cancel, then deletes the agent.
 - **No token counting endpoint.** `count_tokens` is a character estimate;
   billing uses counts Cursor reports after a run.
 - **No raw HTTP passthrough.** `executor.http_request` returns 501.
 - **Upstream failures are classified** before the host sees them. Region/plan
-  refusals fail that one request without parking the credential.
+  refusals and other run-level failures fail that one request without parking
+  the credential. A 401 or 429 that arrives as an `SdkErrorCode` still cools
+  or retires the key.
 - **Stream framing depends on the caller.** Chat-completions vs translated
   protocols need different SSE; the executor picks from the inbound path.
+  Plugin keepalives are only emitted on the SSE path; the raw OpenAI path is
+  framed by the host.
+- **Remote images are fetched by the plugin**, not forwarded as URLs. Only
+  `http`/`https` to a non-loopback, non-private, non-metadata host is accepted;
+  credentials in the URL are refused, and the error text never repeats the path
+  or query. The host HTTP client still follows redirects, so a public URL that
+  302s onto loopback is not blocked here.
+- **Egress is loopback without disabling TLS.** The proxy hop binds `[::1]`
+  and, if that is missing, `127.0.0.2`. It will not bind `127.0.0.1`, because
+  the SDK turns off certificate verification for that backend URL. Linux
+  deployments without IPv6 still work via `127.0.0.2`; macOS without IPv6 and
+  without `127.0.0.2` will fail to start the egress instead of silently going
+  direct. A stock macOS has `[::1]` but not `127.0.0.2`, so IPv6 must stay
+  enabled there for a proxied deployment.
+- **The bridge's bearer token is read from two places only.** The bridge
+  reports its token file in the ready line; the plugin accepts it under the
+  `--state-root` it passed, or under the bridge's own
+  `$TMPDIR/cursor-sdk-bridge-*` directory, which is where a 1.0.30 bridge
+  actually writes it. In the temp case the file must be a regular file that
+  other users cannot write. Any other path is refused, so a substituted bridge
+  cannot make the plugin read an unrelated local file and send it upstream.
 
 ## Usage and compliance
 

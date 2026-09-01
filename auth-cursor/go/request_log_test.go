@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -11,7 +12,7 @@ import (
 )
 
 func TestRequestLogFieldsIdentifyTheCredentialAndModel(t *testing.T) {
-	logCtx := newRequestLogContext(pluginapi.ExecutorRequest{
+	logCtx := newRequestLogContext(context.Background(), pluginapi.ExecutorRequest{
 		AuthID:       "cursor-main.json",
 		AuthProvider: "cursor",
 		StorageJSON:  []byte(`{"type":"cursor","api_key":"key_live_secret","email":"ops@example.com"}`),
@@ -55,7 +56,7 @@ func TestRequestLogFieldsIdentifyTheCredentialAndModel(t *testing.T) {
 }
 
 func TestRequestLogFieldsNeverCarryTheApiKey(t *testing.T) {
-	logCtx := newRequestLogContext(pluginapi.ExecutorRequest{
+	logCtx := newRequestLogContext(context.Background(), pluginapi.ExecutorRequest{
 		AuthID:      "cursor-main.json",
 		StorageJSON: []byte(`{"type":"cursor","api_key":"key_live_secret"}`),
 	}, "auto")

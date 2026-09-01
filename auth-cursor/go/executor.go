@@ -34,16 +34,26 @@ func execute(raw []byte) ([]byte, error) {
 		return errorEnvelope("executor_error", errBuild.Error()), nil
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(withHostCallbackID(context.Background(), req.HostCallbackID))
 	defer cancel()
-	logCtx := newRequestLogContext(req.ExecutorRequest, model)
+	flight := registerInFlight(cancel)
+	defer unregisterInFlight(flight)
+	logCtx := newRequestLogContext(ctx, req.ExecutorRequest, model)
 	result, errRun := runGenerate(ctx, generateReq, nil)
 	if errRun != nil {
 		failure := failureFrom(errRun)
 		logCtx.failed(failure.Message)
 		return upstreamErrorEnvelope("executor_error", failure.Message, failure.HTTPStatus, failure.Retryable), nil
 	}
-	payload, errBody := buildCompletion(newCompletionID(), model, result.text, result.usage)
+	var (
+		payload []byte
+		errBody error
+	)
+	if len(result.toolCalls) > 0 {
+		payload, errBody = buildToolCallCompletion(newCompletionID(), model, result.text, result.toolCalls)
+	} else {
+		payload, errBody = buildCompletion(newCompletionID(), model, result.text, result.usage)
+	}
 	if errBody != nil {
 		logCtx.failed(errBody.Error())
 		return errorEnvelope("executor_error", errBody.Error()), nil
@@ -72,8 +82,12 @@ func executeStream(raw []byte) ([]byte, error) {
 	}
 
 	framing := streamFramingFor(req.ExecutorRequest)
-	logCtx := newRequestLogContext(req.ExecutorRequest, model)
+	ctx, cancel := context.WithCancel(withHostCallbackID(context.Background(), req.HostCallbackID))
+	flight := registerInFlight(cancel)
+	logCtx := newRequestLogContext(ctx, req.ExecutorRequest, model)
 	go func() {
+		defer unregisterInFlight(flight)
+		defer cancel()
 		defer func() {
 			if recovered := recover(); recovered != nil {
 				message := fmt.Sprintf("cursor stream panic: %v", recovered)
@@ -81,7 +95,7 @@ func executeStream(raw []byte) ([]byte, error) {
 				closePluginStream(streamID, message)
 			}
 		}()
-		if errRun := forwardStream(streamID, model, framing, generateReq, &logCtx); errRun != nil {
+		if errRun := forwardStream(ctx, streamID, model, framing, generateReq, &logCtx); errRun != nil {
 			closePluginStream(streamID, errRun.Error())
 			return
 		}
@@ -95,9 +109,10 @@ func executeStream(raw []byte) ([]byte, error) {
 
 // forwardStream translates run deltas into OpenAI SSE chunks. It applies no deadline: once the
 // upstream Cursor run is live the plugin must not time it out.
-func forwardStream(streamID, model string, framing streamFraming, generateReq generateRequest, logCtx *requestLogContext) error {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func forwardStream(ctx context.Context, streamID, model string, framing streamFraming, generateReq generateRequest, logCtx *requestLogContext) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	completionID := newCompletionID()
 	roleSent := false
@@ -121,6 +136,14 @@ func forwardStream(streamID, model string, framing streamFraming, generateReq ge
 		logCtx.failed(message)
 		return fmt.Errorf("%s", message)
 	}
+	if len(result.toolCalls) > 0 {
+		if errEmit := emitToolCallStream(streamID, completionID, model, framing, result.toolCalls, &roleSent); errEmit != nil {
+			logCtx.failed(errEmit.Error())
+			return errEmit
+		}
+		logCtx.completed(nil)
+		return nil
+	}
 	finish := "stop"
 	final := buildStreamChunk(completionID, model, chatCompletionDelta{}, &finish, result.usage)
 	if errEmit := emitPluginStreamChunk(streamID, framing.frame(final)); errEmit != nil {
@@ -133,6 +156,29 @@ func forwardStream(streamID, model string, framing streamFraming, generateReq ge
 	}
 	logCtx.completed(result.usage)
 	return nil
+}
+
+func emitToolCallStream(streamID, completionID, model string, framing streamFraming, calls []chatToolCall, roleSent *bool) error {
+	for i, call := range calls {
+		idx := i
+		deltaCall := call
+		deltaCall.Index = &idx
+		delta := chatCompletionDelta{ToolCalls: []chatToolCall{deltaCall}}
+		if !*roleSent {
+			delta.Role = "assistant"
+			*roleSent = true
+		}
+		chunk := buildStreamChunk(completionID, model, delta, nil, nil)
+		if errEmit := emitPluginStreamChunk(streamID, framing.frame(chunk)); errEmit != nil {
+			return errEmit
+		}
+	}
+	finish := "tool_calls"
+	final := buildStreamChunk(completionID, model, chatCompletionDelta{}, &finish, nil)
+	if errEmit := emitPluginStreamChunk(streamID, framing.frame(final)); errEmit != nil {
+		return errEmit
+	}
+	return emitPluginStreamChunk(streamID, framing.terminator())
 }
 
 // streamFraming selects how chat-completions chunks are wrapped before they leave the plugin.
@@ -210,13 +256,18 @@ func buildGenerateRequest(req pluginapi.ExecutorRequest) (generateRequest, strin
 		return generateRequest{}, "", errParse
 	}
 	return generateRequest{
-		apiKey:      apiKey,
-		proxyURL:    resolveProxyURL(req.StorageJSON),
-		model:       model,
-		params:      chat.Params,
-		optimizeFor: loadedConfig().OptimizeFor,
-		prompt:      chat.Prompt,
-		images:      chat.Images,
+		apiKey:           apiKey,
+		proxyURL:         resolveProxyURL(req.StorageJSON),
+		model:            model,
+		params:           chat.Params,
+		optimizeFor:      loadedConfig().OptimizeFor,
+		prompt:           chat.Prompt,
+		images:           chat.Images,
+		tools:            chat.Tools,
+		toolResults:      chat.ToolResults,
+		sessionPrefix:    chat.SessionPrefix,
+		sessionIncrement: chat.SessionIncrement,
+		incrementImages:  chat.IncrementImages,
 	}, model, nil
 }
 

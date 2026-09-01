@@ -39,6 +39,17 @@ func catalogCacheKey(apiKey string) string {
 	return hex.EncodeToString(digest[:])
 }
 
+func evictStaleCatalogs() {
+	now := time.Now()
+	modelCatalogs.Range(func(key, value any) bool {
+		entry, ok := value.(catalogEntry)
+		if !ok || now.Sub(entry.fetched) > catalogTTL {
+			modelCatalogs.Delete(key)
+		}
+		return true
+	})
+}
+
 // catalogFor returns the models visible to one credential, fetching them when the cache is cold
 // or stale. A refresh forces a fetch regardless of age.
 func catalogFor(ctx context.Context, process *bridgeProcess, apiKey string, refresh bool) ([]*sdkv1.SdkModel, error) {
@@ -49,6 +60,7 @@ func catalogFor(ctx context.Context, process *bridgeProcess, apiKey string, refr
 			if time.Since(entry.fetched) < catalogTTL {
 				return entry.models, nil
 			}
+			modelCatalogs.Delete(key)
 		}
 	}
 	fetchCtx, cancel := context.WithTimeout(ctx, catalogTimeout)
@@ -61,6 +73,7 @@ func catalogFor(ctx context.Context, process *bridgeProcess, apiKey string, refr
 	}
 	models := response.Msg.GetItems()
 	modelCatalogs.Store(key, catalogEntry{models: models, fetched: time.Now()})
+	evictStaleCatalogs()
 	return models, nil
 }
 

@@ -8,8 +8,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +77,16 @@ func (d bridgeDiscovery) validate() error {
 	if d.baseURL() == "" {
 		return fmt.Errorf("bridge discovery carries no address")
 	}
+	parsed, errURL := url.Parse(d.baseURL())
+	if errURL != nil {
+		return fmt.Errorf("bridge discovery URL: %w", errURL)
+	}
+	if !strings.EqualFold(parsed.Scheme, "http") {
+		return fmt.Errorf("bridge discovery URL must be http, got %q", parsed.Scheme)
+	}
+	if !isLoopbackHost(parsed.Hostname()) {
+		return fmt.Errorf("bridge discovery host %q is not loopback", parsed.Hostname())
+	}
 	return nil
 }
 
@@ -98,6 +111,10 @@ type bridgeProcess struct {
 	// egress is the loopback hop this process reaches Cursor through, or nil when it connects
 	// directly.
 	egress *bridgeEgress
+
+	callbackSrv   *http.Server
+	callbackURL   string
+	callbackToken string
 
 	agent   sdkv1connect.SdkAgentServiceClient
 	cursor  sdkv1connect.SdkCursorServiceClient
@@ -128,24 +145,31 @@ func (p *bridgeProcess) exitReason() string {
 // stop asks the bridge to drain, escalates to a kill, and removes its scratch workspace.
 func (p *bridgeProcess) stop() {
 	p.stopOnce.Do(func() {
+		failToolRunsForProcess(p)
+		evictSessionsForProcess(p)
 		ctx, cancel := context.WithTimeout(context.Background(), bridgeShutdownTimeout)
 		defer cancel()
 		if p.control != nil {
 			_, _ = p.control.Shutdown(ctx, connect.NewRequest(&sdkv1.ShutdownRequest{GraceSeconds: 1}))
 		}
-		select {
-		case <-p.exited:
-		case <-time.After(bridgeShutdownTimeout):
-			if p.cmd.Process != nil {
-				_ = p.cmd.Process.Kill()
+		if p.exited != nil {
+			select {
+			case <-p.exited:
+			case <-time.After(bridgeShutdownTimeout):
+				if p.cmd != nil && p.cmd.Process != nil {
+					_ = p.cmd.Process.Kill()
+				}
+				<-p.exited
 			}
-			<-p.exited
 		}
 		if p.workspace != "" {
 			_ = os.RemoveAll(p.workspace)
 		}
 		// After the process, so a graceful drain still has somewhere to send its last calls.
-		p.egress.stop()
+		if p.egress != nil {
+			p.egress.stop()
+		}
+		stopToolCallback(p)
 	})
 }
 
@@ -155,33 +179,75 @@ func (p *bridgeProcess) stop() {
 // takes a proxy from the environment), while the API key is a property of every request. So
 // credentials that share a proxy share a bridge, and the pool is keyed by nothing else.
 var bridgePool = struct {
-	mu    sync.Mutex
-	procs map[string]*bridgeProcess
-}{procs: make(map[string]*bridgeProcess)}
+	mu     sync.Mutex
+	procs  map[string]*bridgeProcess
+	gen    uint64
+	starts map[string]*bridgeStart
+}{procs: make(map[string]*bridgeProcess), starts: make(map[string]*bridgeStart)}
+
+type bridgeStart struct {
+	done    chan struct{}
+	process *bridgeProcess
+	err     error
+}
 
 // acquireBridge returns the bridge serving proxyURL, starting one if there is none.
+//
+// The pool lock only protects the map. Starting and installing happen outside it so a 15-minute
+// download for one proxy cannot block model discovery or requests that use another proxy.
 func acquireBridge(proxyURL string) (*bridgeProcess, error) {
 	bridgePool.mu.Lock()
-	defer bridgePool.mu.Unlock()
 	if existing := bridgePool.procs[proxyURL]; existing != nil {
 		if existing.alive() {
+			bridgePool.mu.Unlock()
 			return existing, nil
 		}
 		hostLog("warn", "cursor sdk bridge restarting", map[string]any{"reason": existing.exitReason()})
 		delete(bridgePool.procs, proxyURL)
 	}
+	if inFlight := bridgePool.starts[proxyURL]; inFlight != nil {
+		bridgePool.mu.Unlock()
+		<-inFlight.done
+		if inFlight.err != nil {
+			return nil, inFlight.err
+		}
+		if inFlight.process != nil && inFlight.process.alive() {
+			return inFlight.process, nil
+		}
+		return acquireBridge(proxyURL)
+	}
+	start := &bridgeStart{done: make(chan struct{})}
+	bridgePool.starts[proxyURL] = start
+	gen := bridgePool.gen
+	bridgePool.mu.Unlock()
+
 	process, errStart := startBridge(loadedConfig(), proxyURL)
+
+	bridgePool.mu.Lock()
+	delete(bridgePool.starts, proxyURL)
 	if errStart != nil {
+		start.err = errStart
+		close(start.done)
+		bridgePool.mu.Unlock()
 		return nil, errStart
 	}
+	if bridgePool.gen != gen {
+		bridgePool.mu.Unlock()
+		process.stop()
+		start.err = fmt.Errorf("cursor sdk bridge was stopped before it was registered")
+		close(start.done)
+		return nil, start.err
+	}
 	bridgePool.procs[proxyURL] = process
+	start.process = process
+	close(start.done)
+	bridgePool.mu.Unlock()
 	return process, nil
 }
 
-// stopBridges shuts every pooled bridge down. It runs on plugin shutdown and whenever a
-// configuration change invalidates the running processes.
 func stopBridges() {
 	bridgePool.mu.Lock()
+	bridgePool.gen++
 	processes := bridgePool.procs
 	bridgePool.procs = make(map[string]*bridgeProcess)
 	bridgePool.mu.Unlock()
@@ -275,6 +341,10 @@ func startBridge(cfg pluginConfig, proxyURL string) (*bridgeProcess, error) {
 		process.stop()
 		return nil, errPing
 	}
+	if errCallback := startToolCallback(process); errCallback != nil {
+		process.stop()
+		return nil, errCallback
+	}
 	hostLog("info", "cursor sdk bridge ready", map[string]any{
 		"bridge_version": discovery.ServerVersion,
 		"pid":            discovery.PID,
@@ -295,23 +365,30 @@ func (p *bridgeProcess) readStderr(pipe io.Reader, discovered chan<- bridgeDisco
 	announced := false
 	for scanner.Scan() {
 		line := scanner.Text()
-		if !announced && strings.HasPrefix(line, bridgeReadyPrefix) {
-			announced = true
+		if strings.HasPrefix(line, bridgeReadyPrefix) {
 			var discovery bridgeDiscovery
 			if errUnmarshal := json.Unmarshal([]byte(line[len(bridgeReadyPrefix):]), &discovery); errUnmarshal != nil {
-				failed <- fmt.Errorf("decode cursor sdk bridge discovery line: %w", errUnmarshal)
+				p.stderr.WriteString("invalid discovery line: " + errUnmarshal.Error())
 				continue
 			}
 			if errValidate := discovery.validate(); errValidate != nil {
-				failed <- errValidate
+				p.stderr.WriteString(errValidate.Error())
 				continue
 			}
-			discovered <- discovery
+			if !announced {
+				announced = true
+				discovered <- discovery
+			}
 			continue
 		}
 		if trimmed := strings.TrimSpace(line); trimmed != "" {
 			p.stderr.WriteString(trimmed)
-			hostLog("debug", "cursor sdk bridge stderr", map[string]any{"line": trimmed})
+		}
+	}
+	if errScan := scanner.Err(); errScan != nil && !announced {
+		select {
+		case failed <- fmt.Errorf("read cursor sdk bridge stderr: %w", errScan):
+		default:
 		}
 	}
 }
@@ -372,6 +449,9 @@ func bridgeAuthToken(discovery bridgeDiscovery) (string, error) {
 	path := strings.TrimSpace(discovery.AuthTokenFile)
 	if path == "" {
 		return "", fmt.Errorf("cursor sdk bridge discovery carries no auth token")
+	}
+	if errPath := validateBridgeTokenPath(path); errPath != nil {
+		return "", errPath
 	}
 	raw, errRead := os.ReadFile(path)
 	if errRead != nil {
@@ -554,4 +634,99 @@ func (t *tailBuffer) String() string {
 func fileExists(path string) bool {
 	info, errStat := os.Stat(path)
 	return errStat == nil && !info.IsDir()
+}
+
+func isLoopbackHost(host string) bool {
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		ips, errLookup := net.LookupIP(host)
+		if errLookup != nil || len(ips) == 0 {
+			return false
+		}
+		for _, resolved := range ips {
+			if !resolved.IsLoopback() {
+				return false
+			}
+		}
+		return true
+	}
+	return ip.IsLoopback()
+}
+
+// bridgeTokenDirPrefix names the private directory the bridge creates under the system temp
+// directory for its bearer token. Verified against cursor-sdk-bridge 1.0.30, which reports
+// $TMPDIR/cursor-sdk-bridge-XXXXXX/auth-token rather than a path under --state-root.
+const bridgeTokenDirPrefix = "cursor-sdk-bridge-"
+
+// validateBridgeTokenPath keeps a substituted bridge from naming an arbitrary local file as its
+// bearer token, which the plugin would otherwise read and send upstream.
+//
+// Two locations are accepted: the state directory this process passed to the bridge, and the
+// bridge's own private directory under the system temp directory. The temp case is where a
+// current bridge actually writes, so it also carries the ownership checks that a shared /tmp
+// needs: a regular file, reached without a symlink hop, and not writable by other users.
+func validateBridgeTokenPath(path string) error {
+	resolved, errResolve := filepath.EvalSymlinks(path)
+	if errResolve != nil {
+		return fmt.Errorf("resolve cursor sdk bridge auth token file: %w", errResolve)
+	}
+	if stateRoot, errRoot := bridgeStateRoot(); errRoot == nil && pathInsideRoot(resolved, stateRoot) {
+		return nil
+	}
+	if errTemp := tokenPathInBridgeTempDir(resolved); errTemp != nil {
+		return errTemp
+	}
+	info, errStat := os.Lstat(resolved)
+	if errStat != nil {
+		return fmt.Errorf("inspect cursor sdk bridge auth token file: %w", errStat)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("cursor sdk bridge auth token file is not a regular file")
+	}
+	// Windows reports POSIX-looking bits that do not describe sharing, so the check is limited
+	// to the platforms where a world-writable temp directory is a real substitution vector.
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("cursor sdk bridge auth token file is writable by other users")
+	}
+	return nil
+}
+
+// tokenPathInBridgeTempDir accepts $TMPDIR/cursor-sdk-bridge-XXXXXX/auth-token and nothing else
+// under the temp directory, so a token file cannot be an arbitrary path a hostile bridge names.
+func tokenPathInBridgeTempDir(resolved string) error {
+	outside := fmt.Errorf("cursor sdk bridge auth token file is outside the state and bridge temp directories")
+	tempRoot, errTemp := filepath.EvalSymlinks(os.TempDir())
+	if errTemp != nil {
+		return outside
+	}
+	parent := filepath.Dir(resolved)
+	if filepath.Clean(filepath.Dir(parent)) != filepath.Clean(tempRoot) {
+		return outside
+	}
+	if !strings.HasPrefix(filepath.Base(parent), bridgeTokenDirPrefix) {
+		return outside
+	}
+	return nil
+}
+
+func pathInsideRoot(path, root string) bool {
+	if strings.TrimSpace(path) == "" || strings.TrimSpace(root) == "" {
+		return false
+	}
+	resolvedRoot, errRoot := filepath.EvalSymlinks(root)
+	if errRoot != nil {
+		resolvedRoot = filepath.Clean(root)
+	}
+	rel, errRel := filepath.Rel(resolvedRoot, filepath.Clean(path))
+	if errRel != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

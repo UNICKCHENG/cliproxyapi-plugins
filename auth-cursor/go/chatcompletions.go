@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"google.golang.org/protobuf/types/known/structpb"
 
 	sdkv1 "github.com/UNICKCHENG/cliproxyapi-plugins/auth-cursor/go/internal/sdk/v1"
 )
@@ -16,9 +17,15 @@ import (
 // chatRequest is the Cursor-facing view of an OpenAI chat completion request. An agent turn takes
 // a single prompt string, so the message list is flattened into a transcript.
 type chatRequest struct {
-	Prompt string
-	Images []chatImage
-	Params []modelParam
+	Prompt           string
+	Images           []chatImage
+	Params           []modelParam
+	Tools            map[string]*sdkv1.CustomToolDefinition
+	ToolNames        []string
+	ToolResults      []chatToolResult
+	SessionPrefix    string
+	SessionIncrement string
+	IncrementImages  []chatImage
 }
 
 // modelParam is one model tuning hint as the client supplied it, before it has been checked
@@ -28,14 +35,33 @@ type modelParam struct {
 	Value string
 }
 
+type chatToolCall struct {
+	Index    *int                 `json:"index,omitempty"`
+	ID       string               `json:"id"`
+	Type     string               `json:"type"`
+	Function chatToolCallFunction `json:"function"`
+}
+
+type chatToolCallFunction struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type chatToolResult struct {
+	CallID  string
+	Content string
+}
+
 type chatCompletionMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string         `json:"role"`
+	Content   string         `json:"content"`
+	ToolCalls []chatToolCall `json:"tool_calls,omitempty"`
 }
 
 type chatCompletionDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string         `json:"role,omitempty"`
+	Content   string         `json:"content,omitempty"`
+	ToolCalls []chatToolCall `json:"tool_calls,omitempty"`
 }
 
 type chatCompletionChoice struct {
@@ -69,6 +95,15 @@ func parseChatRequest(payload []byte) (chatRequest, error) {
 		return chatRequest{}, fmt.Errorf("request payload contains no messages")
 	}
 
+	tools, names, errTools := parseChatTools(payload)
+	if errTools != nil {
+		return chatRequest{}, errTools
+	}
+	tools, names, errChoice := applyToolChoice(payload, tools, names)
+	if errChoice != nil {
+		return chatRequest{}, errChoice
+	}
+
 	var systemParts []string
 	var turns []string
 	var images []chatImage
@@ -78,32 +113,69 @@ func parseChatRequest(payload []byte) (chatRequest, error) {
 		role := strings.ToLower(strings.TrimSpace(message.Get("role").String()))
 		text, messageImages := messageContent(message.Get("content"))
 		images = append(images, messageImages...)
-		if strings.TrimSpace(text) == "" {
-			continue
-		}
 		switch role {
 		case "system", "developer":
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
 			systemParts = append(systemParts, text)
 		case "assistant":
-			turns = append(turns, "Assistant: "+text)
-		case "tool", "function":
+			toolCalls := message.Get("tool_calls").Array()
+			if strings.TrimSpace(text) == "" && len(toolCalls) == 0 {
+				continue
+			}
+			if strings.TrimSpace(text) != "" {
+				turns = append(turns, "Assistant: "+text)
+			}
+			for _, call := range toolCalls {
+				name := strings.TrimSpace(call.Get("function.name").String())
+				args := toolCallArgumentsJSON(call.Get("function.arguments"))
+				id := strings.TrimSpace(call.Get("id").String())
+				line := fmt.Sprintf("Assistant requested tool %s with arguments %s", name, args)
+				if id != "" {
+					line += " [id " + id + "]"
+				}
+				turns = append(turns, line)
+			}
+		case "tool":
+			id := strings.TrimSpace(message.Get("tool_call_id").String())
+			turns = append(turns, fmt.Sprintf("Tool result for %s: %s", id, text))
+		case "function":
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
 			turns = append(turns, "Tool result: "+text)
 		default:
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
 			userTurns++
 			turns = append(turns, "User: "+text)
 		}
 	}
 
-	prompt := buildPrompt(systemParts, turns, userTurns, messages)
-	if strings.TrimSpace(prompt) == "" {
+	toolResults := finalToolResults(messages)
+	prompt := buildPrompt(systemParts, turns, userTurns)
+	if strings.TrimSpace(prompt) == "" && len(toolResults) == 0 {
 		return chatRequest{}, fmt.Errorf("request payload contains no textual content")
 	}
-	return chatRequest{Prompt: prompt, Images: images, Params: chatParams(payload)}, nil
+	prefix, increment, incrementImages := sessionSplit(messages)
+	return chatRequest{
+		Prompt:           prompt,
+		Images:           images,
+		Params:           chatParams(payload),
+		Tools:            tools,
+		ToolNames:        names,
+		ToolResults:      toolResults,
+		SessionPrefix:    prefix,
+		SessionIncrement: increment,
+		IncrementImages:  incrementImages,
+	}, nil
 }
 
 // buildPrompt renders the transcript. A lone user message is forwarded verbatim so simple
 // completions are not wrapped in scaffolding the model would otherwise echo.
-func buildPrompt(systemParts, turns []string, userTurns int, messages []gjson.Result) string {
+func buildPrompt(systemParts, turns []string, userTurns int) string {
 	if len(systemParts) == 0 && userTurns == 1 && len(turns) == 1 {
 		return strings.TrimPrefix(turns[0], "User: ")
 	}
@@ -113,8 +185,83 @@ func buildPrompt(systemParts, turns []string, userTurns int, messages []gjson.Re
 		builder.WriteString("\n\n")
 	}
 	builder.WriteString(strings.Join(turns, "\n\n"))
-	_ = messages
 	return strings.TrimSpace(builder.String())
+}
+
+// sessionSplit cuts the transcript after the last assistant turn. The prefix is what a reused
+// agent has already seen; the increment is what the next Send should carry. No assistant turn
+// means this is the first request of a conversation and reuse does not apply.
+func sessionSplit(messages []gjson.Result) (prefix, increment string, incrementImages []chatImage) {
+	lastAssistant := -1
+	for i, message := range messages {
+		if strings.ToLower(strings.TrimSpace(message.Get("role").String())) == "assistant" {
+			lastAssistant = i
+		}
+	}
+	if lastAssistant < 0 {
+		return "", "", nil
+	}
+	prefix = strings.TrimSpace(renderTranscript(messages[:lastAssistant+1], false))
+	increment = strings.TrimSpace(renderTranscript(messages[lastAssistant+1:], true))
+	for _, message := range messages[lastAssistant+1:] {
+		_, images := messageContent(message.Get("content"))
+		incrementImages = append(incrementImages, images...)
+	}
+	return prefix, increment, incrementImages
+}
+
+func renderTranscript(messages []gjson.Result, increment bool) string {
+	var systemParts []string
+	var turns []string
+	userTurns := 0
+	for _, message := range messages {
+		role := strings.ToLower(strings.TrimSpace(message.Get("role").String()))
+		text, _ := messageContent(message.Get("content"))
+		switch role {
+		case "system", "developer":
+			if increment {
+				continue
+			}
+			if strings.TrimSpace(text) != "" {
+				systemParts = append(systemParts, text)
+			}
+		case "assistant":
+			toolCalls := message.Get("tool_calls").Array()
+			if strings.TrimSpace(text) == "" && len(toolCalls) == 0 {
+				continue
+			}
+			if strings.TrimSpace(text) != "" {
+				turns = append(turns, "Assistant: "+text)
+			}
+			for _, call := range toolCalls {
+				name := strings.TrimSpace(call.Get("function.name").String())
+				args := toolCallArgumentsJSON(call.Get("function.arguments"))
+				id := strings.TrimSpace(call.Get("id").String())
+				line := fmt.Sprintf("Assistant requested tool %s with arguments %s", name, args)
+				if id != "" {
+					line += " [id " + id + "]"
+				}
+				turns = append(turns, line)
+			}
+		case "tool":
+			id := strings.TrimSpace(message.Get("tool_call_id").String())
+			turns = append(turns, fmt.Sprintf("Tool result for %s: %s", id, text))
+		case "function":
+			if strings.TrimSpace(text) != "" {
+				turns = append(turns, "Tool result: "+text)
+			}
+		default:
+			if strings.TrimSpace(text) == "" {
+				continue
+			}
+			userTurns++
+			turns = append(turns, "User: "+text)
+		}
+	}
+	if increment {
+		return strings.Join(turns, "\n\n")
+	}
+	return buildPrompt(systemParts, turns, userTurns)
 }
 
 // messageContent flattens a chat message body, which may be a plain string or an array of
@@ -179,12 +326,20 @@ func parseImage(reference string) (chatImage, bool) {
 // during model resolution, which silently drops anything the selected model does not expose.
 func chatParams(payload []byte) []modelParam {
 	var params []modelParam
-	if effort := strings.TrimSpace(gjson.GetBytes(payload, "reasoning_effort").String()); effort != "" {
-		params = append(params, modelParam{ID: "reasoning_effort", Value: effort})
+	seen := map[string]struct{}{}
+	add := func(id, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		if _, exists := seen[id]; exists {
+			return
+		}
+		seen[id] = struct{}{}
+		params = append(params, modelParam{ID: id, Value: value})
 	}
-	if effort := strings.TrimSpace(gjson.GetBytes(payload, "reasoning.effort").String()); effort != "" {
-		params = append(params, modelParam{ID: "reasoning_effort", Value: effort})
-	}
+	add("reasoning_effort", gjson.GetBytes(payload, "reasoning_effort").String())
+	add("reasoning_effort", gjson.GetBytes(payload, "reasoning.effort").String())
 	return params
 }
 
@@ -245,4 +400,139 @@ func buildStreamChunk(id, model string, delta chatCompletionDelta, finishReason 
 		return nil
 	}
 	return raw
+}
+
+func parseChatTools(payload []byte) (map[string]*sdkv1.CustomToolDefinition, []string, error) {
+	toolsJSON := gjson.GetBytes(payload, "tools")
+	if !toolsJSON.Exists() || !toolsJSON.IsArray() {
+		return nil, nil, nil
+	}
+	tools := make(map[string]*sdkv1.CustomToolDefinition)
+	var names []string
+	for _, tool := range toolsJSON.Array() {
+		typ := strings.TrimSpace(tool.Get("type").String())
+		name := strings.TrimSpace(tool.Get("function.name").String())
+		if typ != "" && typ != "function" {
+			continue
+		}
+		if typ == "" && name == "" {
+			continue
+		}
+		if name == "" {
+			return nil, nil, fmt.Errorf("tool function name is empty")
+		}
+		if _, exists := tools[name]; exists {
+			return nil, nil, fmt.Errorf("duplicate tool name %q", name)
+		}
+		def, errDef := parseFunctionTool(name, tool)
+		if errDef != nil {
+			return nil, nil, errDef
+		}
+		tools[name] = def
+		names = append(names, name)
+	}
+	if len(tools) == 0 {
+		return nil, nil, nil
+	}
+	return tools, names, nil
+}
+
+func parseFunctionTool(name string, tool gjson.Result) (*sdkv1.CustomToolDefinition, error) {
+	params := tool.Get("function.parameters")
+	var schema map[string]any
+	switch {
+	case !params.Exists() || params.Type == gjson.Null:
+		schema = map[string]any{"type": "object"}
+	case !params.IsObject():
+		return nil, fmt.Errorf("tool %q parameters must be a JSON object", name)
+	default:
+		if errUnmarshal := json.Unmarshal([]byte(params.Raw), &schema); errUnmarshal != nil {
+			return nil, fmt.Errorf("tool %q parameters: %w", name, errUnmarshal)
+		}
+	}
+	input, errStruct := structpb.NewStruct(schema)
+	if errStruct != nil {
+		return nil, fmt.Errorf("tool %q parameters: %w", name, errStruct)
+	}
+	def := &sdkv1.CustomToolDefinition{InputSchema: input}
+	if desc := strings.TrimSpace(tool.Get("function.description").String()); desc != "" {
+		def.Description = &desc
+	}
+	return def, nil
+}
+
+func applyToolChoice(payload []byte, tools map[string]*sdkv1.CustomToolDefinition, names []string) (map[string]*sdkv1.CustomToolDefinition, []string, error) {
+	choice := gjson.GetBytes(payload, "tool_choice")
+	if !choice.Exists() {
+		return tools, names, nil
+	}
+	if choice.Type == gjson.String {
+		if choice.String() == "none" {
+			return nil, nil, nil
+		}
+		return tools, names, nil
+	}
+	if !choice.IsObject() {
+		return tools, names, nil
+	}
+	name := strings.TrimSpace(choice.Get("function.name").String())
+	if _, ok := tools[name]; !ok {
+		return nil, nil, fmt.Errorf("tool_choice names unknown tool %q", name)
+	}
+	return map[string]*sdkv1.CustomToolDefinition{name: tools[name]}, []string{name}, nil
+}
+
+func finalToolResults(messages []gjson.Result) []chatToolResult {
+	var block []chatToolResult
+	for i := len(messages) - 1; i >= 0; i-- {
+		role := strings.ToLower(strings.TrimSpace(messages[i].Get("role").String()))
+		if role != "tool" {
+			break
+		}
+		id := strings.TrimSpace(messages[i].Get("tool_call_id").String())
+		if id == "" {
+			break
+		}
+		text, _ := messageContent(messages[i].Get("content"))
+		block = append(block, chatToolResult{CallID: id, Content: text})
+	}
+	for i, j := 0, len(block)-1; i < j; i, j = i+1, j-1 {
+		block[i], block[j] = block[j], block[i]
+	}
+	return block
+}
+
+func toolCallArgumentsJSON(value gjson.Result) string {
+	if !value.Exists() || value.Type == gjson.Null {
+		return "{}"
+	}
+	if value.Type == gjson.String {
+		if text := value.String(); text != "" {
+			return text
+		}
+		return "{}"
+	}
+	if raw := strings.TrimSpace(value.Raw); raw != "" {
+		return raw
+	}
+	return "{}"
+}
+
+func buildToolCallCompletion(id, model, text string, calls []chatToolCall) ([]byte, error) {
+	finish := "tool_calls"
+	return json.Marshal(chatCompletion{
+		ID:      id,
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []chatCompletionChoice{{
+			Index: 0,
+			Message: &chatCompletionMessage{
+				Role:      "assistant",
+				Content:   text,
+				ToolCalls: calls,
+			},
+			FinishReason: &finish,
+		}},
+	})
 }
