@@ -40,10 +40,76 @@ func failureFrom(err error) upstreamFailure {
 	if errors.As(err, &classified) {
 		return classified.failure
 	}
-	if details, ok := sdkErrorDetails(err); ok {
+	// An unspecified code is not a classification, and the bridge does send one: a key Cursor
+	// rejects arrives as UNAUTHENTICATED carrying SDK_ERROR_CODE_UNSPECIFIED. Treating that as
+	// a branchable code would park a dead credential as if it were a transient fault.
+	if details, ok := sdkErrorDetails(err); ok && details.GetSdkErrorCode() != sdkv1.SdkErrorCode_SDK_ERROR_CODE_UNSPECIFIED {
 		return failureFromDetails(details)
 	}
-	return upstreamFailure{Message: err.Error()}
+	return failureFromTransport(err)
+}
+
+// failureFromTransport classifies an error the bridge reported without a usable sdk_error_code.
+//
+// The Connect code is coarser than sdk_error_code and cannot distinguish a fault of the request
+// from one of the credential, which is why it is only consulted once the detail has turned out to
+// carry nothing. The mappings are the standard gRPC ones; what makes them worth having is that
+// the host's handling of 401, 403 and 429 differs from its handling of an unclassified failure,
+// and an unclassified rejected key would cool the credential instead of retiring it.
+func failureFromTransport(err error) upstreamFailure {
+	var connectErr *connect.Error
+	if !errors.As(err, &connectErr) {
+		return upstreamFailure{Message: err.Error()}
+	}
+	message := transportMessage(err, connectErr)
+	switch connectErr.Code() {
+	case connect.CodeUnauthenticated:
+		// Not the bridge's own bearer token: that one is proved by the Ping the handshake
+		// ends with, and it does not change while the process lives.
+		return upstreamFailure{Message: upstreamErrorText(http.StatusUnauthorized, message), HTTPStatus: http.StatusUnauthorized}
+	case connect.CodePermissionDenied:
+		return upstreamFailure{Message: upstreamErrorText(http.StatusForbidden, message), HTTPStatus: http.StatusForbidden}
+	case connect.CodeResourceExhausted:
+		return upstreamFailure{
+			Message:    upstreamErrorText(http.StatusTooManyRequests, message),
+			HTTPStatus: http.StatusTooManyRequests,
+			Retryable:  true,
+		}
+	case connect.CodeDeadlineExceeded, connect.CodeUnavailable:
+		// A bridge that finished its handshake answers or fails fast, so these mean it is
+		// stuck reaching Cursor. Reported verbatim that reads as if the plugin hung, which
+		// sends operators looking in the wrong place; the proxy is what they need to check,
+		// because the bridge reaches Cursor through it.
+		//
+		// It stays unclassified: no status is right for a network outage, which affects every
+		// credential equally rather than discrediting this one.
+		return upstreamFailure{
+			Message: fmt.Sprintf(
+				"could not reach the cursor api (%s): check that the plugin's proxy-url is set and can reach %s",
+				message, cursorBackendHost,
+			),
+			Retryable: true,
+		}
+	default:
+		// Nothing here says whether the credential, the request or Cursor is at fault, so the
+		// error is passed on whole rather than given a status that would misdirect the host.
+		return upstreamFailure{Message: err.Error()}
+	}
+}
+
+// transportMessage picks the most specific text available. The bridge leaves sdk_error_code
+// unspecified while still describing the failure, and that description is what an operator acts
+// on.
+func transportMessage(err error, connectErr *connect.Error) string {
+	if details, ok := sdkErrorDetails(err); ok {
+		if message := strings.TrimSpace(details.GetMessage()); message != "" {
+			return message
+		}
+	}
+	if message := strings.TrimSpace(connectErr.Message()); message != "" {
+		return message
+	}
+	return err.Error()
 }
 
 // sdkErrorDetails pulls the structured detail the bridge attaches to a failed RPC. Branching on

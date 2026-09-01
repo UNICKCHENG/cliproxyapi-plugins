@@ -95,6 +95,9 @@ type bridgeProcess struct {
 	workspace string
 	stderr    *tailBuffer
 	exited    chan struct{}
+	// egress is the loopback hop this process reaches Cursor through, or nil when it connects
+	// directly.
+	egress *bridgeEgress
 
 	agent   sdkv1connect.SdkAgentServiceClient
 	cursor  sdkv1connect.SdkCursorServiceClient
@@ -141,6 +144,8 @@ func (p *bridgeProcess) stop() {
 		if p.workspace != "" {
 			_ = os.RemoveAll(p.workspace)
 		}
+		// After the process, so a graceful drain still has somewhere to send its last calls.
+		p.egress.stop()
 	})
 }
 
@@ -205,18 +210,34 @@ func startBridge(cfg pluginConfig, proxyURL string) (*bridgeProcess, error) {
 		return nil, fmt.Errorf("create cursor sdk bridge workspace: %w", errWorkspace)
 	}
 
+	// A proxy has to be applied here rather than in the child: the bridge's runtime ignores the
+	// proxy environment variables on the path its backend calls take. Failing the start when the
+	// egress cannot come up is deliberate, because falling back to a direct connection would
+	// quietly reinstate the timeout the egress exists to prevent.
+	egress, errEgress := startBridgeEgress(proxyURL)
+	if errEgress != nil {
+		_ = os.RemoveAll(workspace)
+		return nil, errEgress
+	}
+	backendURL := ""
+	if egress != nil {
+		backendURL = egress.baseURL
+	}
+
 	cmd := exec.Command(binary, "--workspace", workspace, "--state-root", stateRoot)
-	cmd.Env = bridgeEnv(proxyURL)
+	cmd.Env = bridgeEnv(proxyURL, backendURL)
 	// The bridge speaks only on stderr, but a child inheriting the host's stdout could still
 	// corrupt its log stream.
 	cmd.Stdout = io.Discard
 	stderrPipe, errStderr := cmd.StderrPipe()
 	if errStderr != nil {
 		_ = os.RemoveAll(workspace)
+		egress.stop()
 		return nil, fmt.Errorf("open cursor sdk bridge stderr: %w", errStderr)
 	}
 	if errStart := cmd.Start(); errStart != nil {
 		_ = os.RemoveAll(workspace)
+		egress.stop()
 		return nil, fmt.Errorf("start cursor sdk bridge (%s): %w", binary, errStart)
 	}
 
@@ -225,6 +246,7 @@ func startBridge(cfg pluginConfig, proxyURL string) (*bridgeProcess, error) {
 		workspace: workspace,
 		stderr:    &tailBuffer{},
 		exited:    make(chan struct{}),
+		egress:    egress,
 	}
 	discovered := make(chan bridgeDiscovery, 1)
 	failed := make(chan error, 1)
@@ -257,6 +279,7 @@ func startBridge(cfg pluginConfig, proxyURL string) (*bridgeProcess, error) {
 		"bridge_version": discovery.ServerVersion,
 		"pid":            discovery.PID,
 		"proxy":          proxyURL != "",
+		"egress":         egress != nil,
 	})
 	return process, nil
 }
@@ -388,11 +411,23 @@ func (a bridgeBearerAuth) WrapStreamingHandler(next connect.StreamingHandlerFunc
 
 // bridgeProxyEnvVars are the variables the bridge's runtime reads for its outbound proxy. Both
 // cases are written because runtimes disagree on which they honour.
+//
+// These only reach the part of the SDK that goes through bun's own fetch(); the backend calls run
+// on bun's node:http default Agent, which ignores them entirely. That is what the egress in
+// bridge_egress.go exists for, and why these variables are not enough on their own.
 var bridgeProxyEnvVars = []string{
 	"HTTP_PROXY", "http_proxy",
 	"HTTPS_PROXY", "https_proxy",
 	"ALL_PROXY", "all_proxy",
 }
+
+// bridgeNoProxyEnvVars are the exemption lists, in both cases for the same reason as above.
+var bridgeNoProxyEnvVars = []string{"NO_PROXY", "no_proxy"}
+
+// bridgeLoopbackNoProxy are the hosts the bridge has to reach directly once its backend URL is
+// the plugin's own egress: sending that hop through the user's proxy would route a local
+// connection out to the internet and back.
+var bridgeLoopbackNoProxy = []string{"127.0.0.1", "::1", "localhost"}
 
 // bridgeStrippedEnvVars are dropped from the inherited environment.
 //
@@ -413,8 +448,12 @@ var bridgeStrippedEnvVars = []string{
 // An inherited proxy setting is left alone when the plugin has none of its own, so a machine that
 // only reaches the internet through a proxy keeps working without extra configuration; a resolved
 // proxyURL overrides it.
-func bridgeEnv(proxyURL string) []string {
-	stripped := make(map[string]struct{}, len(bridgeStrippedEnvVars)+len(bridgeProxyEnvVars))
+//
+// backendURL, when set, is the plugin's egress, and the bridge is pointed at it instead of Cursor.
+// The proxy variables are still written alongside it: they remain the only thing that proxies the
+// SDK's fetch() paths, and the loopback hop to the egress is exempted rather than dropped.
+func bridgeEnv(proxyURL, backendURL string) []string {
+	stripped := make(map[string]struct{}, len(bridgeStrippedEnvVars)+len(bridgeProxyEnvVars)+len(bridgeNoProxyEnvVars)+1)
 	for _, name := range bridgeStrippedEnvVars {
 		stripped[name] = struct{}{}
 	}
@@ -423,7 +462,15 @@ func bridgeEnv(proxyURL string) []string {
 			stripped[name] = struct{}{}
 		}
 	}
-	env := make([]string, 0, len(os.Environ())+len(bridgeProxyEnvVars)+1)
+	if backendURL != "" {
+		// An inherited backend URL is replaced rather than honoured: the egress is the whole
+		// point of this process, and a second opinion on where Cursor lives would defeat it.
+		stripped["CURSOR_BACKEND_URL"] = struct{}{}
+		for _, name := range bridgeNoProxyEnvVars {
+			stripped[name] = struct{}{}
+		}
+	}
+	env := make([]string, 0, len(os.Environ())+len(bridgeProxyEnvVars)+len(bridgeNoProxyEnvVars)+2)
 	for _, entry := range os.Environ() {
 		name, _, found := strings.Cut(entry, "=")
 		if !found {
@@ -439,9 +486,44 @@ func bridgeEnv(proxyURL string) []string {
 			env = append(env, name+"="+proxyURL)
 		}
 	}
+	if backendURL != "" {
+		env = append(env, "CURSOR_BACKEND_URL="+backendURL)
+		noProxy := noProxyWithLoopback(os.Getenv("NO_PROXY"), os.Getenv("no_proxy"))
+		for _, name := range bridgeNoProxyEnvVars {
+			env = append(env, name+"="+noProxy)
+		}
+	}
 	// Lets Cursor attribute this traffic to the Go adapter surface.
 	env = append(env, "CURSOR_SDK_CLIENT_LANGUAGE=go")
 	return env
+}
+
+// noProxyWithLoopback adds the loopback hosts to the exemption lists the host already had, so an
+// operator's own entries survive.
+func noProxyWithLoopback(inherited ...string) string {
+	entries := make([]string, 0, len(bridgeLoopbackNoProxy)+4)
+	seen := make(map[string]struct{}, len(bridgeLoopbackNoProxy)+4)
+	add := func(list string) {
+		for _, entry := range strings.Split(list, ",") {
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				continue
+			}
+			key := strings.ToLower(entry)
+			if _, duplicate := seen[key]; duplicate {
+				continue
+			}
+			seen[key] = struct{}{}
+			entries = append(entries, entry)
+		}
+	}
+	for _, list := range inherited {
+		add(list)
+	}
+	for _, host := range bridgeLoopbackNoProxy {
+		add(host)
+	}
+	return strings.Join(entries, ",")
 }
 
 // tailBuffer keeps the most recent bytes written to it, so a crashed process can report why it

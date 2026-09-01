@@ -274,6 +274,105 @@ func TestFailureFromDetailsMapsErrorCodes(t *testing.T) {
 	}
 }
 
+// The bridge does not always fill sdk_error_code in: a key Cursor rejects arrives as
+// UNAUTHENTICATED carrying SDK_ERROR_CODE_UNSPECIFIED, which is what a real bridge sends. An
+// unspecified code is not a classification, so the Connect code has to be consulted instead —
+// otherwise a dead credential is cooled for a while rather than retired.
+func TestFailureFromFallsBackToTheTransportCode(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		err           error
+		wantStatus    int
+		wantMessage   string
+		wantRetryable bool
+	}{
+		{
+			name:        "rejected key carries no code",
+			err:         sdkErrorResponse(connect.CodeUnauthenticated, &sdkv1.SdkErrorDetails{Message: "Invalid User API Key"}),
+			wantStatus:  http.StatusUnauthorized,
+			wantMessage: "cursor upstream error 401: Invalid User API Key",
+		},
+		{
+			// Nothing structured at all, which is what a bridge-side failure looks like.
+			name:        "no detail at all",
+			err:         connect.NewError(connect.CodeUnauthenticated, errors.New("Invalid User API Key")),
+			wantStatus:  http.StatusUnauthorized,
+			wantMessage: "cursor upstream error 401: Invalid User API Key",
+		},
+		{
+			name:        "forbidden",
+			err:         sdkErrorResponse(connect.CodePermissionDenied, &sdkv1.SdkErrorDetails{Message: "not permitted"}),
+			wantStatus:  http.StatusForbidden,
+			wantMessage: "cursor upstream error 403: not permitted",
+		},
+		{
+			name:          "throttled",
+			err:           sdkErrorResponse(connect.CodeResourceExhausted, &sdkv1.SdkErrorDetails{Message: "Too many requests"}),
+			wantStatus:    http.StatusTooManyRequests,
+			wantMessage:   "cursor upstream error 429: Too many requests",
+			wantRetryable: true,
+		},
+		{
+			// A code that says nothing about whose fault it is must stay unclassified, and
+			// keep the whole error so there is something to diagnose from.
+			name:        "unclassifiable code",
+			err:         connect.NewError(connect.CodeInvalidArgument, errors.New("bad options")),
+			wantMessage: "invalid_argument: bad options",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			failure := failureFrom(test.err)
+			if failure.HTTPStatus != test.wantStatus {
+				t.Errorf("status = %d, want %d", failure.HTTPStatus, test.wantStatus)
+			}
+			if failure.Message != test.wantMessage {
+				t.Errorf("message = %q, want %q", failure.Message, test.wantMessage)
+			}
+			if failure.Retryable != test.wantRetryable {
+				t.Errorf("retryable = %v, want %v", failure.Retryable, test.wantRetryable)
+			}
+		})
+	}
+}
+
+// sdk_error_code is the finer signal and has to keep winning: the Connect code cannot tell a
+// fault of the request from one of the credential, and here it would blame the wrong one.
+func TestFailureFromPrefersTheSdkErrorCode(t *testing.T) {
+	failure := failureFrom(sdkErrorResponse(connect.CodeUnauthenticated, &sdkv1.SdkErrorDetails{
+		SdkErrorCode: sdkv1.SdkErrorCode_SDK_ERROR_CODE_INVALID_MODEL,
+		Message:      "claude-opus-5 is not available on your plan",
+	}))
+	if failure.HTTPStatus != http.StatusBadRequest {
+		t.Errorf("status = %d, want the request blamed rather than the credential", failure.HTTPStatus)
+	}
+	if got := gjson.Get(failure.Message, "error.code").String(); got != "model_not_available" {
+		t.Errorf("error.code = %q, want model_not_available in %s", got, failure.Message)
+	}
+}
+
+// A deadline on a bridge that already answered its handshake means the bridge is stuck reaching
+// Cursor. Reported verbatim it reads as if the plugin hung, which sends operators looking in the
+// wrong place.
+func TestFailureFromExplainsAnUnreachableCursor(t *testing.T) {
+	for _, code := range []connect.Code{connect.CodeDeadlineExceeded, connect.CodeUnavailable} {
+		failure := failureFrom(connect.NewError(code, errors.New("context deadline exceeded")))
+		if !strings.Contains(failure.Message, cursorBackendHost) {
+			t.Errorf("%s message = %q, want it to name %s", code, failure.Message, cursorBackendHost)
+		}
+		if !strings.Contains(failure.Message, "proxy-url") {
+			t.Errorf("%s message = %q, want it to point at the proxy setting", code, failure.Message)
+		}
+		if !failure.Retryable {
+			t.Errorf("%s is not retryable, want a network fault treated as transient", code)
+		}
+		// A network outage affects every credential equally, so it must not be reported with
+		// a status that would discredit this one.
+		if failure.HTTPStatus != 0 {
+			t.Errorf("%s status = %d, want it unclassified", code, failure.HTTPStatus)
+		}
+	}
+}
+
 // A run that fails inside the agent reports free-form text rather than an error code, so the
 // classification has to come from the wording.
 func TestRunFailureClassification(t *testing.T) {

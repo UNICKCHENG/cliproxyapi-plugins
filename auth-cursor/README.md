@@ -33,7 +33,7 @@ client (OpenAI/Claude/Gemini)
   -> host translates to chat-completions
     -> auth-cursor plugin (C ABI)
       -> cursor-sdk-bridge (sdk.v1 over Connect, loopback HTTP/1.1)
-        -> Cursor backend
+        -> Cursor backend, through the plugin's loopback egress when a proxy is configured
 ```
 
 ## Install
@@ -202,15 +202,27 @@ Editing `weights` takes effect through the host's normal config reload; no resta
 
 ## Proxying
 
-Cursor traffic does not pass through the host's HTTP client any more: the bridge opens its
-own HTTPS connections. The host-level `proxy-url` therefore has no effect on it, and the
-proxy has to be given to the bridge instead.
+Cursor traffic does not pass through the host's HTTP client any more: the bridge reaches
+Cursor itself. The **host-level `proxy-url` therefore has no effect on it** — set the proxy
+under `plugins.configs.auth-cursor` as well, or per credential.
 
-The plugin resolves one per credential — the auth file's `proxy_url` first, then the plugin's
-`proxy-url` — and starts one bridge process per resolved proxy, passing it in the process
-environment (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, and their lowercase spellings). A
-proxy already present in the host's own environment is left alone when the plugin has none of
-its own, so a machine that only reaches the internet through a proxy keeps working.
+The plugin resolves one proxy per credential — the auth file's `proxy_url` first, then the
+plugin's `proxy-url` — and starts one bridge process per resolved proxy. A proxy already
+present in the host's own environment is used when the plugin has none of its own, so a
+machine that only reaches the internet through a proxy keeps working.
+
+Applying that proxy is the plugin's job rather than the bridge's. The bridge's runtime issues
+its Cursor calls on an HTTP agent that ignores `HTTP_PROXY` and friends, so the plugin starts
+a small reverse proxy on loopback next to each bridge, points the bridge's Cursor endpoint at
+it, and makes the outbound connection in Go, where the proxy is honoured — including
+`socks5://`. The listener accepts only loopback connections, lives and dies with its bridge,
+and is skipped entirely when there is no proxy to apply, so a direct or TUN setup is
+unaffected. The proxy environment variables are still handed to the bridge, because they do
+reach the parts of the SDK that go through its runtime's own `fetch()`.
+
+If the proxy cannot be dialled, the bridge fails to start and says why; a proxy that accepts
+connections but cannot reach Cursor shows up as `cursor egress request failed` in the log,
+and requests report `could not reach the cursor api`.
 
 Image attachments are the exception: a remote image URL is fetched through the host's HTTP
 client and sent to Cursor as inline bytes, because `sdk.v1` accepts image references only for
@@ -301,6 +313,34 @@ operate it still matters, because every request bills a real Cursor account:
 
 Review Cursor's current terms before deploying; this document is not legal advice.
 
+## Logging
+
+Every finished request writes one line to the host log, so Cursor traffic is searchable the
+same way a built-in channel's is:
+
+```bash
+grep 'cursor request' ~/.cli-proxy-api/logs/main.log
+```
+
+A completed request carries `auth_id`, `auth_label`, `model`, `stream`, `latency_ms`, the
+token counts Cursor reported (`input_tokens`, `output_tokens`, `total_tokens`) and, for
+streams, `ttft_ms`. A failed one carries `failed=true` and the classified error message
+instead. The prompt, the response and the API key are never logged.
+
+Host usage statistics are unaffected by the plugin boundary. A Cursor call is reported under
+the provider key `cursor` together with the credential that served it, its latency, its time to
+first token and its token counts, so per-credential attribution in the management API and the
+dashboard works the same as for a built-in channel.
+
+What differs is `request-log: true`. It records the **client** side of the call as usual, but
+its upstream section stays empty for Cursor: the request reaches the SDK bridge over Connect
+instead of the host's HTTP path, so there is no host-issued HTTP request to capture. If a Web
+UI builds its request view out of that upstream section, Cursor traffic will be missing from
+it. That is a host-side behaviour the plugin cannot change; the log lines above are the
+per-request record to use meanwhile.
+
+Web UI clients keep their own conversation history locally; they do not read these logs.
+
 ## Troubleshooting
 
 | Symptom | Cause |
@@ -312,6 +352,8 @@ Review Cursor's current terms before deploying; this document is not legal advic
 | `verify …: sha256 mismatch` | The downloaded archive is not the pinned release — a proxy or mirror rewrote it. Nothing was installed; fix the network path or set `bridge-path`. |
 | `cursor sdk bridge was not ready within 30s` | The bridge started but never announced its port. The log line `cursor sdk bridge stderr` carries its own diagnostics. |
 | `cursor sdk bridge exited before it was ready` | The binary could not run at all — wrong platform archive, or a `bridge-path` pointing at something else. |
+| `cursor login failed: could not reach the cursor api` | The bridge started but its Cursor call never completed. The host-level `proxy-url` does not apply here — set one under `plugins.configs.auth-cursor` too, and confirm it works: `curl -x <proxy> -I --max-time 15 https://api2.cursor.sh`. See [Proxying](#proxying). |
+| `cursor egress request failed` in the log | The configured proxy accepted the connection but could not reach Cursor. The log line carries the proxy's own error. |
 | `/v1/models` has no Cursor entries | Discovery failed for that credential; check the `cursor model discovery failed` log line for the reason |
 | `cursor upstream error 401: Invalid User API Key` | The key is rejected or revoked; the host then parks the credential, so later requests report `auth_unavailable` instead of repeating the 401 |
 | `Model not available … not supported in your region` | The account's region or plan cannot reach that model — typically the Claude and GPT entries. Only the requested model is refused; the credential keeps serving the rest. Hide the unreachable ids with `oauth-excluded-models.cursor`, or per account with `excluded-models` in the auth file. |
@@ -333,9 +375,10 @@ The tests drive the plugin against an in-process fake `sdk.v1` service, so they 
 Cursor credential, no bridge binary and no network access. They cover the startup handshake
 including its timeout and failure paths, discovery validation, process pooling per proxy,
 the bearer token the bridge requires, bridge download verification and archive extraction
-safety, run streaming and keepalive handling, run cancellation, agent teardown, error-code
-classification, model parameter filtering and `optimize_for` backfill, image inlining, prompt
-flattening, completion and stream chunk assembly, per-protocol stream framing, auth file
+safety, the egress proxy's host routing and stream flushing, run streaming and keepalive
+handling, run cancellation, agent teardown, error-code classification, model parameter
+filtering and `optimize_for` backfill, image inlining, prompt flattening, completion and
+stream chunk assembly, per-protocol stream framing, the per-request log fields, auth file
 claiming, weight resolution, and the `--cursor-login` import including the settings it carries
 over.
 
@@ -354,3 +397,8 @@ the Go toolchain. Regenerating needs [buf](https://buf.build) with `protoc-gen-g
 Bumping the bridge: replace `proto/`, update `bridgeVersion` and the checksums in
 `go/bridge_release.go`, run `make proto`, and check the generated diff. The three move
 together — the contract the plugin is generated against belongs to the release it drives.
+
+Also re-check the two things the egress in `go/bridge_egress.go` reads off the release, since
+neither is part of the published contract: that `CURSOR_BACKEND_URL` still redirects the
+bridge's Cursor calls, and that the hosts it defaults to are still the ones the egress routes
+to. Both are visible as strings in the bridge executable.

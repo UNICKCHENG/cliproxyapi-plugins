@@ -36,15 +36,19 @@ func execute(raw []byte) ([]byte, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	logCtx := newRequestLogContext(req.ExecutorRequest, model)
 	result, errRun := runGenerate(ctx, generateReq, nil)
 	if errRun != nil {
 		failure := failureFrom(errRun)
+		logCtx.failed(failure.Message)
 		return upstreamErrorEnvelope("executor_error", failure.Message, failure.HTTPStatus, failure.Retryable), nil
 	}
 	payload, errBody := buildCompletion(newCompletionID(), model, result.text, result.usage)
 	if errBody != nil {
+		logCtx.failed(errBody.Error())
 		return errorEnvelope("executor_error", errBody.Error()), nil
 	}
+	logCtx.completed(result.usage)
 	return okEnvelope(pluginapi.ExecutorResponse{
 		Payload: payload,
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
@@ -68,13 +72,16 @@ func executeStream(raw []byte) ([]byte, error) {
 	}
 
 	framing := streamFramingFor(req.ExecutorRequest)
+	logCtx := newRequestLogContext(req.ExecutorRequest, model)
 	go func() {
 		defer func() {
 			if recovered := recover(); recovered != nil {
-				closePluginStream(streamID, fmt.Sprintf("cursor stream panic: %v", recovered))
+				message := fmt.Sprintf("cursor stream panic: %v", recovered)
+				logCtx.failed(message)
+				closePluginStream(streamID, message)
 			}
 		}()
-		if errRun := forwardStream(streamID, model, framing, generateReq); errRun != nil {
+		if errRun := forwardStream(streamID, model, framing, generateReq, &logCtx); errRun != nil {
 			closePluginStream(streamID, errRun.Error())
 			return
 		}
@@ -88,13 +95,14 @@ func executeStream(raw []byte) ([]byte, error) {
 
 // forwardStream translates run deltas into OpenAI SSE chunks. It applies no deadline: once the
 // upstream Cursor run is live the plugin must not time it out.
-func forwardStream(streamID, model string, framing streamFraming, generateReq generateRequest) error {
+func forwardStream(streamID, model string, framing streamFraming, generateReq generateRequest, logCtx *requestLogContext) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	completionID := newCompletionID()
 	roleSent := false
 	onDelta := func(text string) error {
+		logCtx.markFirstDelta()
 		// The role rides along with the first content delta. Emitting it in a chunk of its own
 		// makes the Gemini translator report a finished turn before any text.
 		delta := chatCompletionDelta{Content: text}
@@ -109,14 +117,22 @@ func forwardStream(streamID, model string, framing streamFraming, generateReq ge
 	result, errRun := runGenerate(ctx, generateReq, onDelta)
 	if errRun != nil {
 		// The stream bridge carries only text, so the classification has to be in it.
-		return fmt.Errorf("%s", failureFrom(errRun).Message)
+		message := failureFrom(errRun).Message
+		logCtx.failed(message)
+		return fmt.Errorf("%s", message)
 	}
 	finish := "stop"
 	final := buildStreamChunk(completionID, model, chatCompletionDelta{}, &finish, result.usage)
 	if errEmit := emitPluginStreamChunk(streamID, framing.frame(final)); errEmit != nil {
+		logCtx.failed(errEmit.Error())
 		return errEmit
 	}
-	return emitPluginStreamChunk(streamID, framing.terminator())
+	if errEmit := emitPluginStreamChunk(streamID, framing.terminator()); errEmit != nil {
+		logCtx.failed(errEmit.Error())
+		return errEmit
+	}
+	logCtx.completed(result.usage)
+	return nil
 }
 
 // streamFraming selects how chat-completions chunks are wrapped before they leave the plugin.

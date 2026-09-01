@@ -260,13 +260,15 @@ func TestBridgeEnvCarriesTheProxyAndNoCredential(t *testing.T) {
 	t.Setenv("HTTPS_PROXY", "http://inherited:3128")
 	t.Setenv("CURSOR_SDK_BRIDGE_PORT", "9999")
 
-	resolved := envMap(bridgeEnv("socks5://127.0.0.1:1080"))
+	resolved := envMap(bridgeEnv("socks5://127.0.0.1:1080", ""))
 	if _, present := resolved["CURSOR_API_KEY"]; present {
 		t.Error("CURSOR_API_KEY reached the bridge environment")
 	}
 	if _, present := resolved["CURSOR_SDK_BRIDGE_PORT"]; present {
 		t.Error("CURSOR_SDK_BRIDGE_PORT reached the bridge environment and would fight the flags")
 	}
+	// The proxy variables are still written even though the bridge's backend calls ignore them:
+	// they are what proxies the parts of the SDK that go through bun's own fetch().
 	for _, name := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"} {
 		if got := resolved[name]; got != "socks5://127.0.0.1:1080" {
 			t.Errorf("%s = %q, want the resolved proxy", name, got)
@@ -278,12 +280,54 @@ func TestBridgeEnvCarriesTheProxyAndNoCredential(t *testing.T) {
 
 	// With no proxy of its own the plugin leaves the inherited one alone, so a machine that
 	// only reaches the internet through a proxy keeps working.
-	inherited := envMap(bridgeEnv(""))
+	inherited := envMap(bridgeEnv("", ""))
 	if got := inherited["HTTPS_PROXY"]; got != "http://inherited:3128" {
 		t.Errorf("HTTPS_PROXY = %q, want the inherited proxy preserved", got)
 	}
 	if _, present := inherited["CURSOR_API_KEY"]; present {
 		t.Error("CURSOR_API_KEY reached the bridge environment")
+	}
+}
+
+// An egress only works if the bridge is actually pointed at it, and only if the bridge then
+// reaches it directly: routing that loopback hop through the user's proxy would send a local
+// connection out to the internet and back.
+func TestBridgeEnvPointsTheBridgeAtTheEgress(t *testing.T) {
+	t.Setenv("NO_PROXY", "internal.example")
+	t.Setenv("CURSOR_BACKEND_URL", "https://api.example")
+
+	resolved := envMap(bridgeEnv("http://127.0.0.1:9527", "http://[::1]:41234"))
+	if got := resolved["CURSOR_BACKEND_URL"]; got != "http://[::1]:41234" {
+		t.Errorf("CURSOR_BACKEND_URL = %q, want the egress to replace the inherited value", got)
+	}
+	for _, name := range []string{"NO_PROXY", "no_proxy"} {
+		got := resolved[name]
+		for _, want := range []string{"internal.example", "127.0.0.1", "::1", "localhost"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("%s = %q, want %q included", name, got, want)
+			}
+		}
+	}
+	// The proxy is still handed over for the fetch() paths, which do honour it.
+	if got := resolved["HTTPS_PROXY"]; got != "http://127.0.0.1:9527" {
+		t.Errorf("HTTPS_PROXY = %q, want the proxy still written", got)
+	}
+
+	// Without an egress the bridge connects on its own, and nothing about that changes.
+	direct := envMap(bridgeEnv("", ""))
+	if got, present := direct["CURSOR_BACKEND_URL"]; !present || got != "https://api.example" {
+		t.Errorf("CURSOR_BACKEND_URL = %q present = %v, want the inherited value untouched", got, present)
+	}
+	if got, present := direct["NO_PROXY"]; !present || got != "internal.example" {
+		t.Errorf("NO_PROXY = %q present = %v, want the inherited value untouched", got, present)
+	}
+}
+
+func TestNoProxyWithLoopbackDeduplicates(t *testing.T) {
+	got := noProxyWithLoopback("localhost, internal.example", "LOCALHOST,127.0.0.1")
+	want := "localhost,internal.example,127.0.0.1,::1"
+	if got != want {
+		t.Errorf("noProxyWithLoopback = %q, want %q", got, want)
 	}
 }
 
