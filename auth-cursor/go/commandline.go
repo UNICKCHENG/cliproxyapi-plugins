@@ -1,54 +1,79 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"github.com/tidwall/gjson"
+
+	sdkv1 "github.com/UNICKCHENG/cliproxyapi-plugins/auth-cursor/go/internal/sdk/v1"
 )
 
-// loginFlagName is the host-facing flag that triggers the Cursor browser login.
-const loginFlagName = "cursor-login"
+const (
+	// loginFlagName is the host-facing flag that imports a Cursor API key.
+	loginFlagName = "cursor-login"
+	// apiKeyFlagName supplies the key non-interactively, for scripts and CI.
+	apiKeyFlagName = "cursor-api-key"
+)
 
-// loginDeadline bounds the wait for the operator to finish the browser sign-in. Timeouts are
-// permitted here because this is credential acquisition, not an established upstream call.
-const loginDeadline = 10 * time.Minute
+// loginValidateTimeout bounds the Me call that checks the key. A timeout is acceptable here
+// because this is credential acquisition, not an established upstream call.
+const loginValidateTimeout = 60 * time.Second
 
 // commandLineRegister publishes the plugin-owned flags so they appear in -help and can be
-// parsed by the host. Declaring the flag here keeps it tied to the plugin's lifetime: remove
-// the plugin and the flag disappears with it.
+// parsed by the host. Declaring the flags here keeps them tied to the plugin's lifetime: remove
+// the plugin and they disappear with it.
 func commandLineRegister() ([]byte, error) {
 	return okEnvelope(pluginapi.CommandLineRegistrationResponse{
-		Flags: []pluginapi.CommandLineFlag{{
-			Name:  loginFlagName,
-			Usage: "Login to Cursor in a browser and save the minted API key as an auth file",
-			Type:  "bool",
-		}},
+		Flags: []pluginapi.CommandLineFlag{
+			{
+				Name:  loginFlagName,
+				Usage: "Import a Cursor API key as an auth file, prompting for it unless -" + apiKeyFlagName + " is given",
+				Type:  "bool",
+			},
+			{
+				Name:  apiKeyFlagName,
+				Usage: "Cursor API key to import, for non-interactive use. Prefer the prompt: an argument is visible in the process list",
+				Type:  "string",
+			},
+		},
 	})
 }
 
-// commandLineExecute runs the browser login and hands the resulting credential to the host,
+// commandLineExecute imports a Cursor API key and hands the resulting credential to the host,
 // which persists it into the configured auth directory.
+//
+// There is no interactive sign-in to drive: sdk.v1 exposes no login RPC, and a Cursor credential
+// is a key the operator creates in the dashboard. So the command's job is to accept that key,
+// prove it works, and record which account it belongs to.
 func commandLineExecute(raw []byte) ([]byte, error) {
 	var req pluginapi.CommandLineExecutionRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	if !req.TriggeredFlags[loginFlagName].Set {
+	if !req.TriggeredFlags[loginFlagName].Set && !req.TriggeredFlags[apiKeyFlagName].Set {
 		return okEnvelope(pluginapi.CommandLineExecutionResponse{})
 	}
 
-	// -no-browser is a host flag, so read it from the full flag set rather than declaring a
-	// duplicate. Headless hosts still complete the login through the printed URL.
-	noBrowser := strings.EqualFold(strings.TrimSpace(req.Flags["no-browser"].Value), "true")
+	apiKey, errKey := readLoginAPIKey(req.TriggeredFlags[apiKeyFlagName].Value)
+	if errKey != nil {
+		return okEnvelope(pluginapi.CommandLineExecutionResponse{
+			Stderr:   []byte(fmt.Sprintf("cursor login failed: %v\n", errKey)),
+			ExitCode: 1,
+		})
+	}
 
-	credential, errLogin := runLogin(noBrowser)
+	credential, errLogin := importAPIKey(apiKey)
 	if errLogin != nil {
 		return okEnvelope(pluginapi.CommandLineExecutionResponse{
 			Stderr:   []byte(fmt.Sprintf("cursor login failed: %v\n", errLogin)),
@@ -69,70 +94,88 @@ func commandLineExecute(raw []byte) ([]byte, error) {
 	})
 }
 
-// loginCredential is the outcome of a completed browser login.
+// readLoginAPIKey resolves the key from the flag, otherwise by prompting on the terminal.
+//
+// The environment is deliberately not consulted: a credential that can be picked up from the
+// ambient environment is one an operator cannot see the plugin using.
+func readLoginAPIKey(flagValue string) (string, error) {
+	if key := strings.TrimSpace(flagValue); key != "" {
+		return key, nil
+	}
+	if !stdinIsTerminal() {
+		return "", fmt.Errorf("no terminal to prompt on; pass the key with -%s", apiKeyFlagName)
+	}
+	// The host only prints the response streams after the command returns, so the prompt has to
+	// reach the terminal directly to appear before the read.
+	fmt.Fprint(os.Stderr, "Paste your Cursor API key (https://cursor.com/dashboard): ")
+	key, errRead := readAPIKeyFrom(os.Stdin)
+	fmt.Fprintln(os.Stderr)
+	return key, errRead
+}
+
+// readAPIKeyFrom takes one line and trims it, because a pasted key arrives with the newline that
+// submitted it and often with whitespace from the clipboard.
+func readAPIKeyFrom(source io.Reader) (string, error) {
+	key, errRead := bufio.NewReader(source).ReadString('\n')
+	if errRead != nil && !errors.Is(errRead, io.EOF) {
+		return "", fmt.Errorf("read the api key: %w", errRead)
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "", errors.New("no api key was entered")
+	}
+	return key, nil
+}
+
+func stdinIsTerminal() bool {
+	info, errStat := os.Stdin.Stat()
+	if errStat != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// loginCredential is a validated Cursor API key together with the account it belongs to.
 type loginCredential struct {
-	apiKey    string
-	email     string
-	expiresAt time.Time
+	apiKey string
+	email  string
 }
 
-// runLogin drives the sidecar login flow, printing the sign-in URL as soon as the SDK
-// reports it so the operator can complete the flow.
-func runLogin(noBrowser bool) (loginCredential, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), loginDeadline)
+// importAPIKey proves the key works and reads back the account it authenticates as.
+//
+// The Me round trip is what makes the import worth having over hand-writing the auth file: it
+// rejects a mistyped key immediately instead of at the first request, and the email it returns is
+// what names the auth file, so logging in again replaces the credential for that account.
+func importAPIKey(apiKey string) (loginCredential, error) {
+	process, errProcess := acquireBridge(loadedConfig().ProxyURL)
+	if errProcess != nil {
+		return loginCredential{}, errProcess
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), loginValidateTimeout)
 	defer cancel()
-
-	events, release, errCall := callSidecar(ctx, sidecarRequest{
-		Op:         "login",
-		NoBrowser:  noBrowser,
-		APIKeyName: "CLIProxyAPI",
-	})
-	if errCall != nil {
-		return loginCredential{}, errCall
+	response, errMe := process.cursor.Me(ctx, connect.NewRequest(&sdkv1.MeRequest{
+		Options: &sdkv1.CursorRequestOptions{ApiKey: apiKey},
+	}))
+	if errMe != nil {
+		return loginCredential{}, errors.New(failureFrom(errMe).Message)
 	}
-	defer release()
-
-	for event := range events {
-		switch event.Event {
-		case "login_url":
-			// The host only prints the response streams after the command returns, so the
-			// URL has to reach the terminal directly to be usable.
-			fmt.Fprintf(os.Stderr, "\nComplete the Cursor login in your browser:\n\n  %s\n\nWaiting for the login to finish...\n", event.URL)
-		case "login":
-			if strings.TrimSpace(event.APIKey) == "" {
-				return loginCredential{}, fmt.Errorf("cursor login returned an empty api key")
-			}
-			credential := loginCredential{
-				apiKey: strings.TrimSpace(event.APIKey),
-				email:  strings.TrimSpace(event.Email),
-			}
-			if event.ExpiresAt > 0 {
-				// Truncated to the second so the scheduled refresh matches the RFC3339
-				// value persisted in the auth file, which is re-read on the next startup.
-				credential.expiresAt = time.UnixMilli(event.ExpiresAt).UTC().Truncate(time.Second)
-			}
-			return credential, nil
-		case "error":
-			return loginCredential{}, fmt.Errorf("%s", event.errorText())
-		}
-	}
-	if ctx.Err() != nil {
-		return loginCredential{}, fmt.Errorf("cursor login was not completed within %s", loginDeadline)
-	}
-	return loginCredential{}, fmt.Errorf("cursor sidecar closed the stream before the login completed")
+	return loginCredential{
+		apiKey: apiKey,
+		email:  strings.TrimSpace(response.Msg.GetUser().GetUserEmail()),
+	}, nil
 }
 
-// credentialFields are the fields a login owns. Every spelling is cleared before the new
-// values are written, so a stale key or expiry left in the previous file can never outrank
-// the credential that was just minted.
+// credentialFields are the fields an import owns. Every spelling is cleared before the new
+// values are written, so a stale key or an expiry left behind by an earlier login flow can never
+// outrank the credential that was just imported.
 var credentialFields = []string{
 	"type", "email",
 	"api_key", "apiKey",
 	"expires_at", "expiresAt", "expires_at_ms", "apiKeyExpiresAtMs",
 }
 
-// authData renders the credential in the same shape parseAuth already accepts, so a
-// logged-in key and a hand-written key are indistinguishable to the rest of the plugin.
+// authData renders the credential in the same shape parseAuth already accepts, so an imported key
+// and a hand-written key are indistinguishable to the rest of the plugin.
 // The host replaces the auth file wholesale, so operator-owned settings already recorded for
 // this account are carried over rather than lost on every renewal.
 func (c loginCredential) authData(authDir string) (pluginapi.AuthData, error) {
@@ -145,9 +188,6 @@ func (c loginCredential) authData(authDir string) (pluginapi.AuthData, error) {
 	storage["api_key"] = c.apiKey
 	if c.email != "" {
 		storage["email"] = c.email
-	}
-	if !c.expiresAt.IsZero() {
-		storage["expires_at"] = c.expiresAt.Format(time.RFC3339)
 	}
 	raw, errMarshal := json.Marshal(storage)
 	if errMarshal != nil {
@@ -162,10 +202,11 @@ func (c loginCredential) authData(authDir string) (pluginapi.AuthData, error) {
 		ProxyURL: strings.TrimSpace(gjson.GetBytes(raw, "proxy_url").String()),
 		// Read back rather than defaulted: the host writes this flag into the file from the
 		// record it persists, so a preserved "disabled" would be reset by a false here.
-		Disabled:         gjson.GetBytes(raw, "disabled").Bool(),
-		StorageJSON:      raw,
-		Metadata:         map[string]any{"type": providerIdentifier},
-		NextRefreshAfter: refreshDeadline(c.expiresAt),
+		Disabled:    gjson.GetBytes(raw, "disabled").Bool(),
+		StorageJSON: raw,
+		Metadata:    map[string]any{"type": providerIdentifier},
+		// A Cursor API key reports no expiry, so there is nothing for the host to re-check.
+		NextRefreshAfter: refreshDeadline(time.Time{}),
 	}, nil
 }
 
@@ -187,7 +228,7 @@ func existingAuthStorage(authDir, fileName string) map[string]any {
 	return existing
 }
 
-// fileName derives a stable per-account file name so logging in again with the same account
+// fileName derives a stable per-account file name so importing a key for the same account
 // replaces its credential instead of accumulating duplicates.
 func (c loginCredential) fileName() string {
 	account := sanitizeFileComponent(c.email)
@@ -199,15 +240,13 @@ func (c loginCredential) fileName() string {
 
 func (c loginCredential) summary() string {
 	var builder strings.Builder
-	builder.WriteString("Cursor login successful")
+	builder.WriteString("Cursor API key accepted")
 	if c.email != "" {
 		builder.WriteString(" for " + c.email)
 	}
 	builder.WriteString(".\n")
-	if !c.expiresAt.IsZero() {
-		builder.WriteString(fmt.Sprintf("The minted API key expires at %s; run --%s again to renew it.\n",
-			c.expiresAt.Format(time.RFC3339), loginFlagName))
-	}
+	builder.WriteString(fmt.Sprintf("Saved as %s. Revoke or rotate the key in the Cursor dashboard, then run --%s again.\n",
+		c.fileName(), loginFlagName))
 	return builder.String()
 }
 

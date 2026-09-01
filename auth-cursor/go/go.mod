@@ -3,8 +3,10 @@ module github.com/UNICKCHENG/cliproxyapi-plugins/auth-cursor/go
 go 1.26.0
 
 require (
+	connectrpc.com/connect v1.18.1
 	github.com/router-for-me/CLIProxyAPI/v7 v7.2.146
 	github.com/tidwall/gjson v1.18.0
+	google.golang.org/protobuf v1.36.12
 	gopkg.in/yaml.v3 v3.0.1
 )
 

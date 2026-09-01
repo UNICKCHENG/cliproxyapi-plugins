@@ -37,11 +37,13 @@ jobs:
           CGO_ENABLED: "1"
         run: go build -buildmode=c-shared -o "$RUNNER_TEMP/auth-cursor.so" .
 
-      # The tests drive the plugin against a fake NDJSON sidecar, so they need node on PATH
-      # but no Cursor credential and no network access.
+      # The tests drive the plugin against an in-process fake sdk.v1 service, so they need
+      # neither a Cursor credential, nor the cursor-sdk-bridge binary, nor network access.
+      # -race is worth the runtime here: the run driver cancels an abandoned run from a
+      # watcher goroutine while the stream is being torn down.
       - name: Test
         working-directory: auth-cursor/go
-        run: go test ./...
+        run: go test -race ./...
 
       - name: Validate registry
         run: node scripts/validate-registry.mjs

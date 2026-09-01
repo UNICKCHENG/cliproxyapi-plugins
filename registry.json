@@ -4,7 +4,7 @@
     {
       "id": "auth-cursor",
       "name": "Cursor Provider",
-      "description": "Call Cursor models through the official @cursor/sdk agent SDK.",
+      "description": "Call Cursor models through the official Cursor SDK Bridge.",
       "author": "UNICKCHENG",
       "version": "1.1.0",
       "repository": "https://github.com/UNICKCHENG/cliproxyapi-plugins",

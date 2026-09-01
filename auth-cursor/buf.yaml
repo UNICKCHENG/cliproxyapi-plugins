@@ -1,0 +1,13 @@
+# Build configuration for the vendored sdk.v1 contract.
+#
+# The module lives at auth-cursor/ rather than inside proto/ so that proto/ stays a verbatim
+# copy of the pinned cursor/sdk-bridge release and can be replaced wholesale on an upgrade.
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

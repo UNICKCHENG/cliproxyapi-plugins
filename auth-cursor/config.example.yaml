@@ -26,15 +26,15 @@ plugins:
     # provider key used by credentials below.
     auth-cursor:
       enabled: true
-      # Node executable used to run the sidecar. Resolved from PATH by default.
-      # Use an absolute path when the host runs under launchd or systemd, whose PATH
-      # usually omits version-manager installs.
-      node-path: "node"
-      # Directory or index.mjs path. Empty auto-discovers
-      # plugins/<goos>/<goarch>/auth-cursor-sidecar, then falls back to the embedded copy
-      # released into the user cache directory, <cache>/cli-proxy-api/auth-cursor-sidecar/<version>
+      # Path to the cursor-sdk-bridge executable, or to the directory holding it. Empty
+      # downloads the pinned release into the user cache directory on first use,
+      # <cache>/cli-proxy-api/auth-cursor-bridge/<bridge-version>/
       # (~/Library/Caches on macOS, ~/.cache on Linux, %LocalAppData% on Windows).
-      sidecar-path: ""
+      bridge-path: ""
+      # Proxy for credentials whose auth file sets no proxy_url. The bridge connects to
+      # Cursor itself rather than through the host's HTTP client, so the host-level
+      # proxy-url does not reach it and has to be restated here.
+      proxy-url: ""
       # Cursor Router mode applied to the auto-smart model: cost | balanced | intelligence.
       optimize-for: "balanced"
       # Per-credential weighted-round-robin share. Keys are matched case-insensitively
@@ -62,12 +62,16 @@ plugins:
 #   cursor:
 #     - "grok-4.5"
 
-# Credentials live in auth-dir, one JSON file per Cursor API key. Run
-# `cli-proxy-api --cursor-login` to mint one, or add a dashboard key manually.
-# Note that "type" is the provider key `cursor`, not the plugin id `auth-cursor`:
+# Credentials live in auth-dir, one JSON file per Cursor API key. Create the key in the
+# Cursor dashboard, then either run `cli-proxy-api --cursor-login` and paste it, or write
+# the file yourself. Note that "type" is the provider key `cursor`, not the plugin id
+# `auth-cursor`:
 #
 #   $(auth-dir)/cursor-*.json
 #   {"type": "cursor", "api_key": "key_..."}
 #
 # Optional fields: label, prefix, proxy_url, disabled, note, and the per-account
 # model_aliases / excluded-models lists. Re-running --cursor-login preserves them.
+#
+# proxy_url in the auth file routes that one account's Cursor traffic through its own
+# proxy, overriding the plugin-level proxy-url above.

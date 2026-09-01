@@ -1,0 +1,20 @@
+# Code generation for the vendored sdk.v1 contract.
+#
+# Managed mode rewrites go_package, which the upstream protos point at Cursor's own monorepo,
+# without editing the vendored files. Generated code is committed so that building the plugin
+# needs nothing but the Go toolchain; regenerate with `make proto` after bumping proto/.
+version: v2
+managed:
+  enabled: true
+  override:
+    - file_option: go_package_prefix
+      value: github.com/UNICKCHENG/cliproxyapi-plugins/auth-cursor/go/internal
+inputs:
+  - directory: proto
+plugins:
+  - local: protoc-gen-go
+    out: go/internal
+    opt: paths=source_relative
+  - local: protoc-gen-connect-go
+    out: go/internal
+    opt: paths=source_relative

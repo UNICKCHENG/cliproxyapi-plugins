@@ -7,7 +7,7 @@ distributed as a plugin store source you add to your own configuration.
 
 | ID | Description | Docs |
 | --- | --- | --- |
-| `auth-cursor` | Call Cursor models through the official `@cursor/sdk` agent SDK. | [auth-cursor/](auth-cursor/) |
+| `auth-cursor` | Call Cursor models through the official Cursor SDK Bridge. | [auth-cursor/](auth-cursor/) |
 
 <a id="install-auth-cursor"></a>
 
@@ -23,28 +23,32 @@ Configuration details, model behaviour, and troubleshooting live in
   running binary supports dynamic library plugins.
 - A management key configured (`remote-management.secret-key`), because plugins are
   installed through the management API.
-- **Node.js 22.13 or later and `npm` on the host that runs CLIProxyAPI.** The plugin runs a
-  Node sidecar for every request. The store install does not bundle Node for you.
-- A Cursor account.
+- A Cursor account, and an API key created in the
+  [Cursor dashboard](https://cursor.com/dashboard) (personal) or by your team admin
+  (service account).
+- Network access to GitHub releases on first use, for the bridge download described below.
 
-### Sidecar bootstrap (automatic, but Node is required)
+No Node.js or npm is needed. Earlier versions ran a Node sidecar; this one does not.
 
-The store installs only the dynamic library (`auth-cursor.dylib` / `.so` / `.dll`). Sidecar
-scripts are embedded in that library. On the **first use** after an install or upgrade —
-`--cursor-login`, the first server start, or the first request — the plugin:
+### Bridge bootstrap (automatic)
 
-1. writes the scripts into the user cache directory, `<cache>/cli-proxy-api/auth-cursor-sidecar/<version>/`
-   (`~/Library/Caches` on macOS, `~/.cache` or `$XDG_CACHE_HOME` on Linux, `%LocalAppData%` on Windows);
-2. runs `npm install --omit=dev` there once to fetch `@cursor/sdk`.
+Cursor's SDK is a TypeScript agent SDK with no Go client, so the plugin drives the official
+[SDK Bridge](https://cursor.com/docs/sdk/bridge) instead: a local `cursor-sdk-bridge` process
+that the plugin speaks `sdk.v1` Connect/protobuf to.
+
+The store installs only the dynamic library (`auth-cursor.dylib` / `.so` / `.dll`). On the
+**first use** after an install or upgrade — `--cursor-login`, the first server start, or the
+first request — the plugin downloads the pinned bridge release, verifies it against a
+SHA-256 compiled into the library, and unpacks it into the user cache directory,
+`<cache>/cli-proxy-api/auth-cursor-bridge/<bridge-version>/` (`~/Library/Caches` on macOS,
+`~/.cache` or `$XDG_CACHE_HOME` on Linux, `%LocalAppData%` on Windows).
 
 The cache directory is deliberate: the default `auth-dir` is `~/.cli-proxy-api`, and anything
-the npm tree leaves there is scanned as a credential candidate.
+left there is scanned as a credential candidate.
 
-You do **not** need to copy sidecar files or run `npm install` yourself, and you can leave
-`sidecar-path` empty. You **do** need Node and npm on the machine, and that first use
-needs network access to the npm registry. Expect it to sit on
-`installing cursor sidecar dependencies` for up to a minute; later runs reuse the same
-directory.
+Leave `bridge-path` empty for this. If the host cannot reach GitHub, download the archive
+elsewhere and point `bridge-path` at the unpacked tree — see
+[auth-cursor/README.md](auth-cursor/README.md#the-bridge-binary).
 
 ### Steps
 
@@ -61,8 +65,8 @@ plugins:
   configs:
     auth-cursor:
       enabled: true
-      node-path: "node"   # see step 5 if you run under a service manager
-      sidecar-path: ""
+      bridge-path: ""     # empty downloads the pinned cursor-sdk-bridge on first use
+      proxy-url: ""       # see step 5
       optimize-for: "balanced"
       weights: {}         # per-credential share for weighted routing
 ```
@@ -106,36 +110,42 @@ Expect `"registered": true` and `"effective_enabled": true`. If `registered` is 
 that `plugins.dir` resolves (use an absolute path under a service manager) and that the binary
 reports `X-CPA-SUPPORT-PLUGIN: 1`.
 
-**5. Set `node-path` when running as a service**
+**5. Set a proxy if the host needs one**
 
-Interactive shells usually resolve `node-path: "node"` from PATH. Service managers
-(launchd, systemd, brew services) often expose a minimal PATH, so set an absolute path:
+The bridge connects to Cursor itself rather than through the host's HTTP client, so the
+host-level `proxy-url` does not apply to it. Restate it for the plugin, or per credential
+with `proxy_url` in the auth file:
 
 ```yaml
 plugins:
   configs:
     auth-cursor:
-      node-path: "/opt/homebrew/bin/node"   # or your mise / nvm / asdf path
+      proxy-url: "http://127.0.0.1:7890"   # or socks5://…
 ```
 
-`npm` is looked up next to `node-path` before PATH, so a version-manager install works even
-when the service PATH does not expose it.
+A proxy already exported into the host's environment is inherited when this is empty, so
+skip this step if that is how the machine is set up.
 
-**6. Sign in to Cursor**
+**6. Import your Cursor API key**
+
+Create the key in the [Cursor dashboard](https://cursor.com/dashboard) first, then:
 
 ```bash
-./cli-proxy-api --cursor-login              # opens the browser
-./cli-proxy-api --cursor-login --no-browser # prints the URL instead
+./cli-proxy-api --cursor-login
+Paste your Cursor API key (https://cursor.com/dashboard): key_...
 ```
 
-The first run after an install or upgrade may pause for up to a minute on
-`installing cursor sidecar dependencies` while `npm install` fetches `@cursor/sdk`. Wait
-for that to finish; the browser URL is printed afterwards. Later logins skip this step.
+The first run after an install or upgrade downloads `cursor-sdk-bridge` before the prompt
+appears — tens of megabytes, once per bridge version.
 
-This mints a user API key and writes `cursor-<account>.json` into `auth-dir`, then exits
-without starting the server. Re-running it later renews the key and keeps the settings you
-added to that file. See [auth-cursor/README.md](auth-cursor/README.md#credentials) for
-dashboard keys and expiry behaviour.
+The key is checked against Cursor before anything is written, so a typo fails here rather
+than at the first request. The account it belongs to names the file, `cursor-<account>.json`
+in `auth-dir`, and the command then exits without starting the server. Re-running it replaces
+the key and keeps the settings you added to that file.
+
+There is no browser sign-in. For scripts, `--cursor-login --cursor-api-key "key_..."` skips
+the prompt; you can also write the auth file yourself. Both are covered in
+[auth-cursor/README.md](auth-cursor/README.md#credentials).
 
 **7. Start the server and verify**
 
@@ -146,10 +156,8 @@ curl -H "Authorization: Bearer $API_KEY" localhost:8317/v1/chat/completions \
   -d '{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}]}'
 ```
 
-If `--cursor-login` already finished the sidecar bootstrap, these requests are fast.
-Otherwise the first `/v1/models` or chat request after an install may take up to a minute
-while `npm install` runs. Later requests reuse
-`<cache>/cli-proxy-api/auth-cursor-sidecar/<version>/`.
+If `--cursor-login` already downloaded the bridge, these requests are fast. Otherwise the
+first one waits for that download.
 
 ### Common install issues
 
@@ -158,10 +166,13 @@ while `npm install` runs. Later requests reuse
 | Plugin missing from `/v0/management/plugins` | `plugins.enabled` is off, or `plugins.dir` does not resolve |
 | `"registered": false` | The library failed to load; the binary may lack CGO plugin support |
 | `create plugin directory: mkdir plugins: read-only file system` (or `mkdir ~: …`) | Relative `plugins.dir` (`"plugins"`) or a literal `~` is resolved against the service CWD, often `/` under Homebrew `brew services` / launchd. Set an absolute writable path such as `/Users/<you>/.cli-proxy-api/plugins` and restart. Same class of bug: [CLIProxyAPI #4313](https://github.com/router-for-me/CLIProxyAPI/issues/4313). |
-| `no such file or directory` naming `node` | Set an absolute `node-path` (step 5) |
-| `/v1/models` has no Cursor entries | Sidecar failed to start — usually a missing or wrong `node-path` |
-| `--cursor-login` or first start sits on `installing cursor sidecar dependencies` | Normal: first use after install/upgrade runs `npm install` for `@cursor/sdk` (up to ~1 minute, needs npm registry access). Wait for `cursor sidecar dependencies installed`. Later runs reuse `<cache>/cli-proxy-api/auth-cursor-sidecar/<version>/`. |
-| Hundreds of `auth-cursor-sidecar/.../package.json` entries in the auth file list, and `DELETE` on them returns 400 | Plugin version 1.0.0 and earlier bootstrapped the sidecar inside the default `auth-dir`. Upgrade; the plugin deletes `~/.cli-proxy-api/auth-cursor-sidecar/` on its next bootstrap. Remove that directory by hand if you pin `sidecar-path`. |
+| `download …cursor-sdk-bridge-standalone-…tar.gz` fails | The host cannot reach GitHub releases. Fix the network path, set `proxy-url`, or install the bridge by hand and set `bridge-path`. |
+| `verify …: sha256 mismatch` | The archive is not the pinned release — a proxy or mirror rewrote it. Nothing was installed. |
+| `cursor sdk bridge exited before it was ready` | The bridge binary cannot run here; check the message it printed, or set `bridge-path` to a bridge you installed. |
+| `/v1/models` has no Cursor entries | Discovery failed for that credential; check the `cursor model discovery failed` log line |
+| `--cursor-login` sits with no prompt on first run | Normal: the pinned bridge is downloading. Later runs reuse `<cache>/cli-proxy-api/auth-cursor-bridge/<bridge-version>/`. |
+| `no terminal to prompt on` from `--cursor-login` | stdin is not a terminal (a service manager, or a redirect). Pass `--cursor-api-key` instead. |
+| Hundreds of `auth-cursor-sidecar/.../package.json` entries in the auth file list, and `DELETE` on them returns 400 | Plugin version 1.0.0 and earlier bootstrapped a Node sidecar inside the default `auth-dir`. This version runs no sidecar; remove `~/.cli-proxy-api/auth-cursor-sidecar/` by hand. |
 
 More detail: [auth-cursor/README.md — Troubleshooting](auth-cursor/README.md#troubleshooting).
 
@@ -210,9 +221,8 @@ make test
 make install INSTALL_DIR=/path/to/CLIProxyAPI/plugins
 ```
 
-`make install` also places a ready-to-run sidecar at
-`plugins/<GOOS>/<GOARCH>/auth-cursor-sidecar/`, which the plugin prefers over the cache
-bootstrap directory, so a development host never runs `npm install` at request time.
+`make install` copies only the library. The bridge is fetched into the user cache directory on
+first use, or taken from `bridge-path` / `CURSOR_SDK_BRIDGE_BIN` if you already have one.
 
 ## Releasing
 

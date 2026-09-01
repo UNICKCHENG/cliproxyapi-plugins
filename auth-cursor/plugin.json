@@ -1,7 +1,7 @@
 {
   "id": "auth-cursor",
   "name": "Cursor Provider",
-  "description": "Call Cursor models through the official @cursor/sdk agent SDK.",
+  "description": "Call Cursor models through the official Cursor SDK Bridge.",
   "author": "UNICKCHENG",
   "license": "MIT",
   "tags": [

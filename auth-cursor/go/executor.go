@@ -29,43 +29,26 @@ func execute(raw []byte) ([]byte, error) {
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
 		return nil, errUnmarshal
 	}
-	sidecarReq, model, errBuild := buildGenerateRequest(req.ExecutorRequest, false)
+	generateReq, model, errBuild := buildGenerateRequest(req.ExecutorRequest)
 	if errBuild != nil {
 		return errorEnvelope("executor_error", errBuild.Error()), nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	events, release, errCall := callSidecar(ctx, sidecarReq)
-	if errCall != nil {
-		return errorEnvelope("executor_error", errCall.Error()), nil
+	result, errRun := runGenerate(ctx, generateReq, nil)
+	if errRun != nil {
+		failure := failureFrom(errRun)
+		return upstreamErrorEnvelope("executor_error", failure.Message, failure.HTTPStatus, failure.Retryable), nil
 	}
-	defer release()
-
-	var text strings.Builder
-	for event := range events {
-		switch event.Event {
-		case "delta":
-			text.WriteString(event.Text)
-		case "done":
-			body := event.Text
-			if body == "" {
-				body = text.String()
-			}
-			payload, errBody := buildCompletion(newCompletionID(), model, body, event.Usage)
-			if errBody != nil {
-				return errorEnvelope("executor_error", errBody.Error()), nil
-			}
-			return okEnvelope(pluginapi.ExecutorResponse{
-				Payload: payload,
-				Headers: http.Header{"Content-Type": []string{"application/json"}},
-			})
-		case "error":
-			failure := event.failure()
-			return upstreamErrorEnvelope("executor_error", failure.Message, failure.HTTPStatus, failure.Retryable), nil
-		}
+	payload, errBody := buildCompletion(newCompletionID(), model, result.text, result.usage)
+	if errBody != nil {
+		return errorEnvelope("executor_error", errBody.Error()), nil
 	}
-	return errorEnvelope("executor_error", "cursor sidecar closed the stream before completing"), nil
+	return okEnvelope(pluginapi.ExecutorResponse{
+		Payload: payload,
+		Headers: http.Header{"Content-Type": []string{"application/json"}},
+	})
 }
 
 // executeStream hands the response back through the host stream bridge: the RPC returns as
@@ -79,7 +62,7 @@ func executeStream(raw []byte) ([]byte, error) {
 	if streamID == "" {
 		return errorEnvelope("executor_error", "stream_id is required for executor.execute_stream"), nil
 	}
-	sidecarReq, model, errBuild := buildGenerateRequest(req.ExecutorRequest, true)
+	generateReq, model, errBuild := buildGenerateRequest(req.ExecutorRequest)
 	if errBuild != nil {
 		return errorEnvelope("executor_error", errBuild.Error()), nil
 	}
@@ -91,7 +74,7 @@ func executeStream(raw []byte) ([]byte, error) {
 				closePluginStream(streamID, fmt.Sprintf("cursor stream panic: %v", recovered))
 			}
 		}()
-		if errRun := forwardStream(streamID, model, framing, sidecarReq); errRun != nil {
+		if errRun := forwardStream(streamID, model, framing, generateReq); errRun != nil {
 			closePluginStream(streamID, errRun.Error())
 			return
 		}
@@ -103,54 +86,37 @@ func executeStream(raw []byte) ([]byte, error) {
 	})
 }
 
-// forwardStream translates sidecar delta events into OpenAI SSE chunks. It applies no
-// deadline: once the upstream Cursor run is live the plugin must not time it out.
-func forwardStream(streamID, model string, framing streamFraming, sidecarReq sidecarRequest) error {
+// forwardStream translates run deltas into OpenAI SSE chunks. It applies no deadline: once the
+// upstream Cursor run is live the plugin must not time it out.
+func forwardStream(streamID, model string, framing streamFraming, generateReq generateRequest) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	events, release, errCall := callSidecar(ctx, sidecarReq)
-	if errCall != nil {
-		return errCall
-	}
-	defer release()
 
 	completionID := newCompletionID()
 	roleSent := false
-
-	for event := range events {
-		switch event.Event {
-		case "delta":
-			if event.Text == "" {
-				continue
-			}
-			// The role rides along with the first content delta. Emitting it in a chunk of
-			// its own makes the Gemini translator report a finished turn before any text.
-			delta := chatCompletionDelta{Content: event.Text}
-			if !roleSent {
-				delta.Role = "assistant"
-				roleSent = true
-			}
-			chunk := buildStreamChunk(completionID, model, delta, nil, nil)
-			if errEmit := emitPluginStreamChunk(streamID, framing.frame(chunk)); errEmit != nil {
-				// The downstream client is gone; stop the upstream run instead of draining it.
-				cancel()
-				return errEmit
-			}
-		case "done":
-			finish := "stop"
-			final := buildStreamChunk(completionID, model, chatCompletionDelta{}, &finish, event.Usage)
-			if errEmit := emitPluginStreamChunk(streamID, framing.frame(final)); errEmit != nil {
-				cancel()
-				return errEmit
-			}
-			return emitPluginStreamChunk(streamID, framing.terminator())
-		case "error":
-			cancel()
-			// The stream bridge carries only text, so the classification has to be in it.
-			return fmt.Errorf("%s", event.failure().Message)
+	onDelta := func(text string) error {
+		// The role rides along with the first content delta. Emitting it in a chunk of its own
+		// makes the Gemini translator report a finished turn before any text.
+		delta := chatCompletionDelta{Content: text}
+		if !roleSent {
+			delta.Role = "assistant"
+			roleSent = true
 		}
+		chunk := buildStreamChunk(completionID, model, delta, nil, nil)
+		return emitPluginStreamChunk(streamID, framing.frame(chunk))
 	}
-	return fmt.Errorf("cursor sidecar closed the stream before completing")
+
+	result, errRun := runGenerate(ctx, generateReq, onDelta)
+	if errRun != nil {
+		// The stream bridge carries only text, so the classification has to be in it.
+		return fmt.Errorf("%s", failureFrom(errRun).Message)
+	}
+	finish := "stop"
+	final := buildStreamChunk(completionID, model, chatCompletionDelta{}, &finish, result.usage)
+	if errEmit := emitPluginStreamChunk(streamID, framing.frame(final)); errEmit != nil {
+		return errEmit
+	}
+	return emitPluginStreamChunk(streamID, framing.terminator())
 }
 
 // streamFraming selects how chat-completions chunks are wrapped before they leave the plugin.
@@ -210,32 +176,31 @@ func requestPathMetadata(metadata map[string]any) string {
 	}
 }
 
-// buildGenerateRequest converts the host's chat-completions payload into a sidecar request.
-func buildGenerateRequest(req pluginapi.ExecutorRequest, stream bool) (sidecarRequest, string, error) {
+// buildGenerateRequest converts the host's chat-completions payload into a bridge run request.
+func buildGenerateRequest(req pluginapi.ExecutorRequest) (generateRequest, string, error) {
 	apiKey, errKey := requireAPIKey(req.StorageJSON)
 	if errKey != nil {
-		return sidecarRequest{}, "", errKey
+		return generateRequest{}, "", errKey
 	}
 	model := strings.TrimSpace(req.Model)
 	if model == "" {
 		model = strings.TrimSpace(gjson.GetBytes(req.Payload, "model").String())
 	}
 	if model == "" {
-		return sidecarRequest{}, "", fmt.Errorf("request does not specify a model")
+		return generateRequest{}, "", fmt.Errorf("request does not specify a model")
 	}
 	chat, errParse := parseChatRequest(req.Payload)
 	if errParse != nil {
-		return sidecarRequest{}, "", errParse
+		return generateRequest{}, "", errParse
 	}
-	return sidecarRequest{
-		Op:          "generate",
-		APIKey:      apiKey,
-		Model:       model,
-		Params:      chat.Params,
-		OptimizeFor: loadedConfig().OptimizeFor,
-		Prompt:      chat.Prompt,
-		Images:      chat.Images,
-		Stream:      stream,
+	return generateRequest{
+		apiKey:      apiKey,
+		proxyURL:    resolveProxyURL(req.StorageJSON),
+		model:       model,
+		params:      chat.Params,
+		optimizeFor: loadedConfig().OptimizeFor,
+		prompt:      chat.Prompt,
+		images:      chat.Images,
 	}, model, nil
 }
 

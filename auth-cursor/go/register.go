@@ -21,15 +21,18 @@ const defaultOptimizeFor = "balanced"
 // reject a misconfigured value while the config is loading rather than at request time.
 const maxCredentialWeight = 1_000_000
 
-// pluginVersion is reported to the host and keys the sidecar bootstrap directory. Release
-// builds override it with -ldflags "-X main.pluginVersion=<release version>".
+// pluginVersion is reported to the host and keys the bridge state directory. Release builds
+// override it with -ldflags "-X main.pluginVersion=<release version>".
 var pluginVersion = "0.0.0-dev"
 
 var currentConfig atomic.Value
 
 type pluginConfig struct {
-	NodePath    string `yaml:"node-path"`
-	SidecarPath string `yaml:"sidecar-path"`
+	BridgePath string `yaml:"bridge-path"`
+	// ProxyURL is the fallback proxy for credentials whose auth file sets no proxy_url. Cursor
+	// traffic no longer passes through the host's HTTP client, so the host's global proxy setting
+	// does not reach it and has to be restated here.
+	ProxyURL    string `yaml:"proxy-url"`
 	OptimizeFor string `yaml:"optimize-for"`
 	// Weights maps a credential, named by account email or auth file name, to its
 	// weighted-round-robin share. Weights live here instead of in the auth file because the
@@ -71,14 +74,11 @@ type registrationCapability struct {
 }
 
 func defaultPluginConfig() pluginConfig {
-	return pluginConfig{
-		NodePath:    "node",
-		OptimizeFor: defaultOptimizeFor,
-	}
+	return pluginConfig{OptimizeFor: defaultOptimizeFor}
 }
 
 // configure decodes the plugin-owned YAML block and swaps it in atomically. A configuration
-// change also drops the running sidecar so the next request picks up the new settings.
+// change also drops the running bridges so the next request picks up the new settings.
 func configure(raw []byte) error {
 	var req lifecycleRequest
 	if len(raw) > 0 {
@@ -96,8 +96,10 @@ func configure(raw []byte) error {
 	}
 	previous, hadPrevious := currentConfig.Load().(pluginConfig)
 	currentConfig.Store(cfg)
-	if hadPrevious && (previous.NodePath != cfg.NodePath || previous.SidecarPath != cfg.SidecarPath) {
-		stopSidecar()
+	// A bridge process is bound to the binary it was launched from and to the proxy in its
+	// environment, so neither setting can be changed on a running one.
+	if hadPrevious && (previous.BridgePath != cfg.BridgePath || previous.ProxyURL != cfg.ProxyURL) {
+		stopBridges()
 	}
 	return nil
 }
@@ -107,11 +109,8 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 	if errUnmarshal := yaml.Unmarshal(raw, &cfg); errUnmarshal != nil {
 		return pluginConfig{}, errUnmarshal
 	}
-	cfg.NodePath = strings.TrimSpace(cfg.NodePath)
-	if cfg.NodePath == "" {
-		cfg.NodePath = "node"
-	}
-	cfg.SidecarPath = strings.TrimSpace(cfg.SidecarPath)
+	cfg.BridgePath = strings.TrimSpace(cfg.BridgePath)
+	cfg.ProxyURL = strings.TrimSpace(cfg.ProxyURL)
 	cfg.OptimizeFor = strings.ToLower(strings.TrimSpace(cfg.OptimizeFor))
 	if cfg.OptimizeFor == "" {
 		cfg.OptimizeFor = defaultOptimizeFor
@@ -171,14 +170,14 @@ func pluginRegistration() registration {
 			GitHubRepository: "https://github.com/UNICKCHENG/cliproxyapi-plugins",
 			ConfigFields: []pluginapi.ConfigField{
 				{
-					Name:        "node-path",
+					Name:        "bridge-path",
 					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Node.js executable used to run the Cursor SDK sidecar. Defaults to \"node\" resolved from PATH.",
+					Description: "Path to the cursor-sdk-bridge executable or the directory holding it. Empty downloads the pinned release into <cache>/cli-proxy-api/auth-cursor-bridge on first use.",
 				},
 				{
-					Name:        "sidecar-path",
+					Name:        "proxy-url",
 					Type:        pluginapi.ConfigFieldTypeString,
-					Description: "Path to the sidecar directory or its index.mjs. Empty auto-discovers a local cursor-sidecar directory, then falls back to the embedded copy under ~/.cli-proxy-api.",
+					Description: "Proxy for credentials whose auth file sets no proxy_url. The bridge reaches Cursor itself, so the host's global proxy-url does not apply to it.",
 				},
 				{
 					Name:        "optimize-for",

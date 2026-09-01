@@ -12,12 +12,12 @@ import (
 )
 
 // apiKeyRefreshInterval keeps the host from re-checking a static API key in a tight loop.
-// Dashboard keys carry no expiry the plugin can read, and none of them can be rotated
+// Cursor API keys carry no expiry the plugin can read, and none of them can be rotated
 // programmatically: renewal always means the operator supplying a new key.
 const apiKeyRefreshInterval = 365 * 24 * time.Hour
 
-// reloginHint is appended wherever an expired or missing credential needs operator action.
-const reloginHint = "run `--" + loginFlagName + "` to mint a new key"
+// newKeyHint is appended wherever a rejected or missing credential needs operator action.
+const newKeyHint = "run `--" + loginFlagName + "` to import a new Cursor API key"
 
 // weightAttribute is the routing attribute the host reads for weighted round-robin.
 const weightAttribute = "weight"
@@ -43,7 +43,7 @@ func parseAuth(raw []byte) ([]byte, error) {
 	expiry := expiryFromStorage(req.RawJSON)
 	if !expiry.IsZero() && !time.Now().UTC().Before(expiry) {
 		return errorEnvelope("invalid_auth", fmt.Sprintf("cursor api key expired at %s; %s",
-			expiry.Format(time.RFC3339), reloginHint)), nil
+			expiry.Format(time.RFC3339), newKeyHint)), nil
 	}
 
 	data := pluginapi.AuthData{
@@ -61,9 +61,9 @@ func parseAuth(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.AuthParseResponse{Handled: true, Auth: data})
 }
 
-// refreshAuth re-validates the stored key without rotating it. Cursor has no refresh token:
-// keys minted by the login flow expire (90 days by default) and can only be replaced by
-// logging in again, so refresh reports expiry rather than attempting a renewal.
+// refreshAuth re-validates the stored key without rotating it. Cursor has no refresh token and no
+// programmatic key rotation: a Dashboard or service-account key is replaced only by the operator
+// importing a new one, so refresh reports expiry rather than attempting a renewal.
 func refreshAuth(raw []byte) ([]byte, error) {
 	var req pluginapi.AuthRefreshRequest
 	if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
@@ -75,7 +75,7 @@ func refreshAuth(raw []byte) ([]byte, error) {
 	expiry := expiryFromStorage(req.StorageJSON)
 	if !expiry.IsZero() && !time.Now().UTC().Before(expiry) {
 		return errorEnvelope("invalid_auth", fmt.Sprintf("cursor api key expired at %s; %s",
-			expiry.Format(time.RFC3339), reloginHint)), nil
+			expiry.Format(time.RFC3339), newKeyHint)), nil
 	}
 	next := refreshDeadline(expiry)
 	data := pluginapi.AuthData{
@@ -163,20 +163,35 @@ func attributesWithoutWeight(attributes map[string]string) map[string]string {
 	return out
 }
 
-// loginStart reports that the management/TUI login flow is not wired up. Cursor's sign-in
-// completes in a browser on the operator's own machine and mints a key there, so the login
-// runs as the `--cursor-login` command rather than as a server-hosted OAuth round trip.
+// loginStart reports that there is no interactive login to host. A Cursor credential is an API
+// key the operator creates in the Cursor dashboard, so there is no authorization round trip for
+// the management API to drive: the key is imported on the host or written into an auth file.
 func loginStart() ([]byte, error) {
-	return errorEnvelope("unsupported", "cursor login is not available through the management API; "+
-		reloginHint+" on the host, or save an API key auth file: "+
+	return errorEnvelope("unsupported", "cursor has no interactive login; "+
+		newKeyHint+" on the host, or save an API key auth file: "+
 		`{"type":"cursor","api_key":"<key>"}`), nil
 }
 
 func loginPoll() ([]byte, error) {
 	return okEnvelope(pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusError,
-		Message: "cursor login is not available through the management API; " + reloginHint + " on the host instead",
+		Message: "cursor has no interactive login; " + newKeyHint + " on the host instead",
 	})
+}
+
+// resolveProxyURL picks the proxy the bridge should use for one credential: the credential's own
+// proxy_url first, then the plugin-level fallback.
+//
+// The host's global proxy-url is deliberately not consulted. It governs the host's HTTP client,
+// which Cursor traffic no longer passes through, so honouring it here would claim a policy the
+// plugin cannot actually enforce.
+func resolveProxyURL(storage []byte) string {
+	if len(storage) > 0 && gjson.ValidBytes(storage) {
+		if value := strings.TrimSpace(gjson.GetBytes(storage, "proxy_url").String()); value != "" {
+			return value
+		}
+	}
+	return loadedConfig().ProxyURL
 }
 
 // apiKeyFromStorage reads the credential from the persisted auth JSON, tolerating both the

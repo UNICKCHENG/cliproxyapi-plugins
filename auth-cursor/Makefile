@@ -1,7 +1,7 @@
 GO ?= go
-NPM ?= npm
+BUF ?= buf
 
-# VERSION is compiled into the library and keys the sidecar bootstrap directory.
+# VERSION is compiled into the library and keys the bridge state directory.
 VERSION ?= 0.0.0-dev
 
 GOOS := $(shell $(GO) env GOOS)
@@ -25,11 +25,10 @@ ARCHIVE := $(DIST_DIR)/$(PLUGIN_ID)_$(VERSION)_$(GOOS)_$(GOARCH).zip
 # INSTALL_DIR points at a CLIProxyAPI checkout's plugins tree for local development.
 INSTALL_DIR ?=
 INSTALL_PLUGIN_DIR := $(INSTALL_DIR)/$(GOOS)/$(GOARCH)
-INSTALL_SIDECAR_DIR := $(INSTALL_PLUGIN_DIR)/$(PLUGIN_ID)-sidecar
 
 LDFLAGS := -X main.pluginVersion=$(VERSION)
 
-.PHONY: build release install sidecar-deps test fmt clean
+.PHONY: build release install proto test fmt clean
 
 ## build compiles the C-ABI shared library the host loads with dlopen.
 build: | $(DIST_DIR)
@@ -42,18 +41,19 @@ release: build
 	cd "$(DIST_DIR)" && rm -f "$(notdir $(ARCHIVE))" && zip -q -X "$(notdir $(ARCHIVE))" "$(PLUGIN_ID).$(PLUGIN_EXT)"
 	@echo "$(ARCHIVE)"
 
-## install copies the library and a ready-to-run sidecar into a CLIProxyAPI checkout so a
-## development host skips the home-directory bootstrap.
-install: build sidecar-deps
+## install copies the library into a CLIProxyAPI checkout. Nothing else has to be placed:
+## the plugin installs the pinned cursor-sdk-bridge into the user cache directory on first
+## use, or uses the bridge-path setting.
+install: build
 	@test -n "$(INSTALL_DIR)" || { echo "set INSTALL_DIR=<CLIProxyAPI>/plugins"; exit 1; }
-	mkdir -p "$(INSTALL_PLUGIN_DIR)" "$(INSTALL_SIDECAR_DIR)"
+	mkdir -p "$(INSTALL_PLUGIN_DIR)"
 	cp "$(PLUGIN_LIB)" "$(INSTALL_PLUGIN_DIR)/"
-	cp go/sidecar/index.mjs go/sidecar/http-bridge.mjs go/sidecar/package.json "$(INSTALL_SIDECAR_DIR)/"
-	cp -R go/sidecar/node_modules "$(INSTALL_SIDECAR_DIR)/"
 
-## sidecar-deps installs the sidecar dependencies in the source tree for local runs.
-sidecar-deps:
-	cd go/sidecar && $(NPM) install --omit=dev --no-audit --no-fund
+## proto regenerates the sdk.v1 clients from the vendored protos. The generated code is
+## committed, so this only runs when the pinned bridge release changes.
+proto:
+	$(BUF) generate
+	cd go && gofmt -w internal
 
 test:
 	cd go && $(GO) test ./...

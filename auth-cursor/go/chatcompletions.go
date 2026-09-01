@@ -9,14 +9,23 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+
+	sdkv1 "github.com/UNICKCHENG/cliproxyapi-plugins/auth-cursor/go/internal/sdk/v1"
 )
 
-// chatRequest is the Cursor-facing view of an OpenAI chat completion request. The Agent SDK
-// takes a single prompt string, so the message list is flattened into a transcript.
+// chatRequest is the Cursor-facing view of an OpenAI chat completion request. An agent turn takes
+// a single prompt string, so the message list is flattened into a transcript.
 type chatRequest struct {
 	Prompt string
-	Images []sidecarImage
-	Params []sidecarParam
+	Images []chatImage
+	Params []modelParam
+}
+
+// modelParam is one model tuning hint as the client supplied it, before it has been checked
+// against what the selected model actually exposes.
+type modelParam struct {
+	ID    string
+	Value string
 }
 
 type chatCompletionMessage struct {
@@ -62,7 +71,7 @@ func parseChatRequest(payload []byte) (chatRequest, error) {
 
 	var systemParts []string
 	var turns []string
-	var images []sidecarImage
+	var images []chatImage
 	userTurns := 0
 
 	for _, message := range messages {
@@ -110,7 +119,7 @@ func buildPrompt(systemParts, turns []string, userTurns int, messages []gjson.Re
 
 // messageContent flattens a chat message body, which may be a plain string or an array of
 // typed parts, into text plus any attached images.
-func messageContent(content gjson.Result) (string, []sidecarImage) {
+func messageContent(content gjson.Result) (string, []chatImage) {
 	if content.Type == gjson.String {
 		return content.String(), nil
 	}
@@ -118,7 +127,7 @@ func messageContent(content gjson.Result) (string, []sidecarImage) {
 		return "", nil
 	}
 	var texts []string
-	var images []sidecarImage
+	var images []chatImage
 	for _, part := range content.Array() {
 		switch strings.TrimSpace(part.Get("type").String()) {
 		case "text", "input_text":
@@ -141,40 +150,40 @@ func messageContent(content gjson.Result) (string, []sidecarImage) {
 	return strings.Join(texts, "\n"), images
 }
 
-// parseImage accepts both inline data URLs and remote references, matching the two shapes
-// the Cursor SDK allows for SDKImage.
-func parseImage(reference string) (sidecarImage, bool) {
+// parseImage separates inline data URLs, which already carry their bytes, from remote references
+// the plugin still has to fetch before a local agent will accept them.
+func parseImage(reference string) (chatImage, bool) {
 	reference = strings.TrimSpace(reference)
 	if reference == "" {
-		return sidecarImage{}, false
+		return chatImage{}, false
 	}
 	if !strings.HasPrefix(reference, "data:") {
-		return sidecarImage{URL: reference}, true
+		return chatImage{URL: reference}, true
 	}
 	comma := strings.Index(reference, ",")
 	if comma < 0 {
-		return sidecarImage{}, false
+		return chatImage{}, false
 	}
 	header := reference[len("data:"):comma]
 	if !strings.Contains(header, ";base64") {
-		return sidecarImage{}, false
+		return chatImage{}, false
 	}
 	mimeType := strings.TrimSpace(strings.Split(header, ";")[0])
 	if mimeType == "" {
-		mimeType = "image/png"
+		mimeType = defaultImageMimeType
 	}
-	return sidecarImage{Data: reference[comma+1:], MimeType: mimeType}, true
+	return chatImage{Data: reference[comma+1:], MimeType: mimeType}, true
 }
 
-// chatParams forwards model tuning hints. The sidecar validates them against the account's
-// model catalog and silently drops anything the selected model does not expose.
-func chatParams(payload []byte) []sidecarParam {
-	var params []sidecarParam
+// chatParams forwards model tuning hints. They are checked against the account's model catalog
+// during model resolution, which silently drops anything the selected model does not expose.
+func chatParams(payload []byte) []modelParam {
+	var params []modelParam
 	if effort := strings.TrimSpace(gjson.GetBytes(payload, "reasoning_effort").String()); effort != "" {
-		params = append(params, sidecarParam{ID: "reasoning_effort", Value: effort})
+		params = append(params, modelParam{ID: "reasoning_effort", Value: effort})
 	}
 	if effort := strings.TrimSpace(gjson.GetBytes(payload, "reasoning.effort").String()); effort != "" {
-		params = append(params, sidecarParam{ID: "reasoning_effort", Value: effort})
+		params = append(params, modelParam{ID: "reasoning_effort", Value: effort})
 	}
 	return params
 }
@@ -189,12 +198,12 @@ func newCompletionID() string {
 
 // convertUsage maps Cursor token accounting onto OpenAI's prompt/completion split. Cache
 // reads are prompt tokens that were served from cache, so they belong on the prompt side.
-func convertUsage(usage *sidecarUsage) *chatCompletionUsage {
+func convertUsage(usage *sdkv1.TokenUsage) *chatCompletionUsage {
 	if usage == nil {
 		return nil
 	}
-	prompt := usage.InputTokens + usage.CacheReadTokens
-	completion := usage.OutputTokens
+	prompt := usage.GetInputTokens() + usage.GetCacheReadTokens()
+	completion := usage.GetOutputTokens()
 	return &chatCompletionUsage{
 		PromptTokens:     prompt,
 		CompletionTokens: completion,
@@ -202,7 +211,7 @@ func convertUsage(usage *sidecarUsage) *chatCompletionUsage {
 	}
 }
 
-func buildCompletion(id, model, text string, usage *sidecarUsage) ([]byte, error) {
+func buildCompletion(id, model, text string, usage *sdkv1.TokenUsage) ([]byte, error) {
 	finish := "stop"
 	return json.Marshal(chatCompletion{
 		ID:      id,
@@ -218,7 +227,7 @@ func buildCompletion(id, model, text string, usage *sidecarUsage) ([]byte, error
 	})
 }
 
-func buildStreamChunk(id, model string, delta chatCompletionDelta, finishReason *string, usage *sidecarUsage) []byte {
+func buildStreamChunk(id, model string, delta chatCompletionDelta, finishReason *string, usage *sdkv1.TokenUsage) []byte {
 	chunk := chatCompletion{
 		ID:      id,
 		Object:  "chat.completion.chunk",

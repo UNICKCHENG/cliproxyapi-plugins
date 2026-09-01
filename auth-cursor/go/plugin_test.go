@@ -2,87 +2,23 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"github.com/tidwall/gjson"
+	"google.golang.org/protobuf/types/known/durationpb"
+
+	sdkv1 "github.com/UNICKCHENG/cliproxyapi-plugins/auth-cursor/go/internal/sdk/v1"
 )
-
-// fakeSidecar speaks the same NDJSON protocol as the real sidecar but never contacts
-// Cursor, so the executor and transport can be exercised without a live credential.
-const fakeSidecar = `
-import { createInterface } from "node:readline";
-
-const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
-
-createInterface({ input: process.stdin }).on("line", (line) => {
-  if (!line.trim()) return;
-  const req = JSON.parse(line);
-  if (req.op === "cancel") return;
-  if (req.op === "models") {
-    send({ id: req.id, event: "models", models: [{ id: "fake-model", display_name: "Fake" }] });
-    return;
-  }
-  if (req.op === "login") {
-    send({ id: req.id, event: "login_url", url: "https://cursor.com/login?challenge=test" });
-    send({
-      id: req.id,
-      event: "login",
-      api_key: "key_minted",
-      email: "Dev.User+cli@example.com",
-      expires_at_ms: Date.now() + 90 * 24 * 60 * 60 * 1000,
-    });
-    return;
-  }
-  if (req.api_key === "bad-key") {
-    send({ id: req.id, event: "error", message: "Invalid User API Key", code: "unauthorized", http_status: 401 });
-    return;
-  }
-  // A refusal raised inside an agent run: Cursor reports no HTTP status for these.
-  if (req.api_key === "region-key") {
-    send({
-      id: req.id,
-      event: "error",
-      message: "Model not available This model provider is not supported in your region.",
-    });
-    return;
-  }
-  send({ id: req.id, event: "delta", text: "Hello" });
-  send({ id: req.id, event: "delta", text: " world" });
-  send({
-    id: req.id,
-    event: "done",
-    status: "done",
-    text: "Hello world",
-    usage: { inputTokens: 7, outputTokens: 2, cacheReadTokens: 3, totalTokens: 12 },
-  });
-});
-`
-
-// useFakeSidecar points the plugin at the fake sidecar for the duration of a test.
-func useFakeSidecar(t *testing.T) {
-	t.Helper()
-	node, errLook := exec.LookPath("node")
-	if errLook != nil {
-		t.Skipf("node is required for sidecar tests: %v", errLook)
-	}
-	script := filepath.Join(t.TempDir(), "index.mjs")
-	if errWrite := os.WriteFile(script, []byte(fakeSidecar), 0o600); errWrite != nil {
-		t.Fatalf("write fake sidecar: %v", errWrite)
-	}
-	currentConfig.Store(pluginConfig{NodePath: node, SidecarPath: script, OptimizeFor: defaultOptimizeFor})
-	stopSidecar()
-	t.Cleanup(func() {
-		stopSidecar()
-		currentConfig.Store(defaultPluginConfig())
-	})
-}
 
 func executorRequest(t *testing.T, apiKey string, payload map[string]any) []byte {
 	t.Helper()
@@ -94,7 +30,7 @@ func executorRequest(t *testing.T, apiKey string, payload map[string]any) []byte
 		ExecutorRequest: pluginapi.ExecutorRequest{
 			Model:       "fake-model",
 			Payload:     rawPayload,
-			StorageJSON: []byte(`{"type":"cursor","api_key":"` + apiKey + `"}`),
+			StorageJSON: storageJSON(apiKey),
 		},
 	})
 	if errMarshal != nil {
@@ -113,7 +49,7 @@ func decodeEnvelope(t *testing.T, raw []byte) envelope {
 }
 
 func TestExecuteAssemblesCompletion(t *testing.T) {
-	useFakeSidecar(t)
+	bridge := useFakeBridge(t)
 
 	raw, errExecute := execute(executorRequest(t, "good-key", map[string]any{
 		"model":    "fake-model",
@@ -147,10 +83,63 @@ func TestExecuteAssemblesCompletion(t *testing.T) {
 	if completion.Usage == nil || completion.Usage.PromptTokens != 10 || completion.Usage.CompletionTokens != 2 {
 		t.Errorf("usage = %+v, want prompt=10 completion=2", completion.Usage)
 	}
+	// A non-streaming request has nothing to do with deltas, so it must not ask for them.
+	if len(bridge.enableDeltas) != 1 || bridge.enableDeltas[0] {
+		t.Errorf("enable_deltas = %v, want [false] for a non-streaming request", bridge.enableDeltas)
+	}
+}
+
+// Every request creates a throwaway agent, so both teardown calls have to happen: CloseAgent
+// releases the local resources and DeleteAgent removes the durable row the bridge wrote for it.
+func TestExecuteReleasesAndDeletesTheAgent(t *testing.T) {
+	bridge := useFakeBridge(t)
+
+	if _, errExecute := execute(executorRequest(t, "good-key", map[string]any{
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})); errExecute != nil {
+		t.Fatalf("execute: %v", errExecute)
+	}
+	if got := bridge.closedAgents(); len(got) != 1 || got[0] != "agent-1" {
+		t.Errorf("closed agents = %v, want [agent-1]", got)
+	}
+	if got := bridge.deletedAgents(); len(got) != 1 || got[0] != "agent-1" {
+		t.Errorf("deleted agents = %v, want [agent-1] so bridge state does not accumulate", got)
+	}
+}
+
+// The agent is a text generator, so it must be created with an explicit empty tool list. An unset
+// list would give it the default toolset, which can reach the host filesystem.
+func TestCreateAgentRequestsNoToolsAndAThrowawayWorkspace(t *testing.T) {
+	bridge := useFakeBridge(t)
+
+	if _, errExecute := execute(executorRequest(t, "good-key", map[string]any{
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})); errExecute != nil {
+		t.Fatalf("execute: %v", errExecute)
+	}
+	created := bridge.createdAgents()
+	if len(created) != 1 {
+		t.Fatalf("created agents = %d, want 1", len(created))
+	}
+	options := created[0]
+	if options.GetTools() == nil {
+		t.Error("tools is unset, want an empty ToolList so no built-in tools are offered")
+	}
+	if names := options.GetTools().GetNames(); len(names) != 0 {
+		t.Errorf("tool names = %v, want none", names)
+	}
+	// The key travels on the request rather than in the bridge environment, because one bridge
+	// process serves every credential that shares its proxy.
+	if options.GetApiKey() != "good-key" {
+		t.Errorf("api key = %q, want it set explicitly on the request", options.GetApiKey())
+	}
+	if cwd := options.GetLocal().GetCwd(); len(cwd) != 1 || cwd[0] == "" {
+		t.Errorf("local cwd = %v, want a single scratch directory", cwd)
+	}
 }
 
 func TestExecuteSurfacesUpstreamStatus(t *testing.T) {
-	useFakeSidecar(t)
+	useFakeBridge(t)
 
 	raw, errExecute := execute(executorRequest(t, "bad-key", map[string]any{
 		"messages": []map[string]any{{"role": "user", "content": "hi"}},
@@ -175,7 +164,7 @@ func TestExecuteSurfacesUpstreamStatus(t *testing.T) {
 // A model the account's region cannot reach must fail as a request fault. Reported as an
 // unclassified failure it would park the credential and take down the models it can reach.
 func TestExecuteReportsModelUnavailableAsRequestFault(t *testing.T) {
-	useFakeSidecar(t)
+	useFakeBridge(t)
 
 	raw, errExecute := execute(executorRequest(t, "region-key", map[string]any{
 		"model":    "fake-model",
@@ -201,88 +190,502 @@ func TestExecuteReportsModelUnavailableAsRequestFault(t *testing.T) {
 	}
 }
 
-func TestSidecarEventFailureClassification(t *testing.T) {
+func TestFailureFromDetailsMapsErrorCodes(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		event      sidecarEvent
-		wantStatus int
-		wantType   string
+		name          string
+		details       *sdkv1.SdkErrorDetails
+		wantStatus    int
+		wantType      string
+		wantRetryable bool
 	}{
 		{
-			name:       "region refusal without a status",
-			event:      sidecarEvent{Message: "Model not available This model provider is not supported in your region."},
-			wantStatus: 400,
+			name:       "rejected key",
+			details:    &sdkv1.SdkErrorDetails{SdkErrorCode: sdkv1.SdkErrorCode_SDK_ERROR_CODE_UNAUTHORIZED, Message: "Invalid User API Key"},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name:       "no key reached the bridge",
+			details:    &sdkv1.SdkErrorDetails{SdkErrorCode: sdkv1.SdkErrorCode_SDK_ERROR_CODE_API_KEY_NOT_FOUND, Message: "missing key"},
+			wantStatus: http.StatusUnauthorized,
+		},
+		{
+			name: "rate limit carries its suggested wait",
+			details: &sdkv1.SdkErrorDetails{
+				SdkErrorCode: sdkv1.SdkErrorCode_SDK_ERROR_CODE_RATE_LIMIT_EXCEEDED,
+				Message:      "Too many requests",
+				RetryAfter:   durationpb.New(30 * time.Second),
+			},
+			wantStatus:    http.StatusTooManyRequests,
+			wantRetryable: true,
+		},
+		{
+			name:       "usage limit is throttling too",
+			details:    &sdkv1.SdkErrorDetails{SdkErrorCode: sdkv1.SdkErrorCode_SDK_ERROR_CODE_USAGE_LIMIT_EXCEEDED, Message: "monthly limit reached"},
+			wantStatus: http.StatusTooManyRequests,
+		},
+		{
+			name:       "unknown model is the request's fault",
+			details:    &sdkv1.SdkErrorDetails{SdkErrorCode: sdkv1.SdkErrorCode_SDK_ERROR_CODE_INVALID_MODEL, Message: "no such model"},
+			wantStatus: http.StatusBadRequest,
 			wantType:   "invalid_request_error",
 		},
 		{
-			name:       "plan restriction",
-			event:      sidecarEvent{Message: "claude-opus-5 is not available on your plan"},
-			wantStatus: 400,
+			name:       "plan restriction is the request's fault",
+			details:    &sdkv1.SdkErrorDetails{SdkErrorCode: sdkv1.SdkErrorCode_SDK_ERROR_CODE_PLAN_REQUIRED, Message: "upgrade required"},
+			wantStatus: http.StatusBadRequest,
 			wantType:   "invalid_request_error",
 		},
 		{
-			name:       "rejected key keeps its own status",
-			event:      sidecarEvent{Message: "Invalid User API Key", HTTPStatus: 401},
-			wantStatus: 401,
+			name:       "validation failure is the request's fault",
+			details:    &sdkv1.SdkErrorDetails{SdkErrorCode: sdkv1.SdkErrorCode_SDK_ERROR_CODE_VALIDATION_ERROR, Message: "bad options"},
+			wantStatus: http.StatusBadRequest,
+			wantType:   "invalid_request_error",
 		},
 		{
-			// Cursor pairs rate limits with prose about model availability often enough that
-			// the status has to win, otherwise a throttled credential stops being cooled.
-			name:       "rate limit outranks availability wording",
-			event:      sidecarEvent{Message: "model unavailable, too many requests", HTTPStatus: 429},
-			wantStatus: 429,
+			name:       "forbidden role",
+			details:    &sdkv1.SdkErrorDetails{SdkErrorCode: sdkv1.SdkErrorCode_SDK_ERROR_CODE_ROLE_FORBIDDEN, Message: "not permitted"},
+			wantStatus: http.StatusForbidden,
 		},
 		{
-			name:       "unrecognised failure stays unclassified",
-			event:      sidecarEvent{Message: "cursor run failed"},
+			// A transient bridge or provider fault says nothing about the credential or the
+			// request, so inventing a status for it would misdirect the host.
+			name:       "internal error stays unclassified",
+			details:    &sdkv1.SdkErrorDetails{SdkErrorCode: sdkv1.SdkErrorCode_SDK_ERROR_CODE_INTERNAL_ERROR, Message: "boom"},
+			wantStatus: 0,
+		},
+		{
+			name:       "unknown code stays unclassified",
+			details:    &sdkv1.SdkErrorDetails{SdkErrorCode: sdkv1.SdkErrorCode(9999), Message: "from the future"},
 			wantStatus: 0,
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			failure := test.event.failure()
+			failure := failureFromDetails(test.details)
 			if failure.HTTPStatus != test.wantStatus {
 				t.Errorf("status = %d, want %d", failure.HTTPStatus, test.wantStatus)
 			}
-			gotType := gjson.Get(failure.Message, "error.type").String()
-			if gotType != test.wantType {
-				t.Errorf("error.type = %q, want %q in %s", gotType, test.wantType, failure.Message)
+			if got := gjson.Get(failure.Message, "error.type").String(); got != test.wantType {
+				t.Errorf("error.type = %q, want %q in %s", got, test.wantType, failure.Message)
+			}
+			if failure.Retryable != test.wantRetryable {
+				t.Errorf("retryable = %v, want %v", failure.Retryable, test.wantRetryable)
 			}
 		})
 	}
 }
 
-func TestCallSidecarStreamsDeltasThenDone(t *testing.T) {
-	useFakeSidecar(t)
-
-	events, release, errCall := callSidecar(context.Background(), sidecarRequest{
-		Op:     "generate",
-		APIKey: "good-key",
-		Model:  "fake-model",
-		Prompt: "hi",
-		Stream: true,
-	})
-	if errCall != nil {
-		t.Fatalf("callSidecar: %v", errCall)
+// A run that fails inside the agent reports free-form text rather than an error code, so the
+// classification has to come from the wording.
+func TestRunFailureClassification(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		message    string
+		wantStatus int
+		wantType   string
+	}{
+		{
+			name:       "region refusal",
+			message:    "Model not available This model provider is not supported in your region.",
+			wantStatus: http.StatusBadRequest,
+			wantType:   "invalid_request_error",
+		},
+		{
+			name:       "plan restriction",
+			message:    "claude-opus-5 is not available on your plan",
+			wantStatus: http.StatusBadRequest,
+			wantType:   "invalid_request_error",
+		},
+		{
+			name:       "unrecognised failure stays unclassified",
+			message:    "cursor run failed",
+			wantStatus: 0,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			failure := runFailure(test.message)
+			if failure.HTTPStatus != test.wantStatus {
+				t.Errorf("status = %d, want %d", failure.HTTPStatus, test.wantStatus)
+			}
+			if got := gjson.Get(failure.Message, "error.type").String(); got != test.wantType {
+				t.Errorf("error.type = %q, want %q in %s", got, test.wantType, failure.Message)
+			}
+		})
 	}
-	defer release()
+}
+
+func TestSdkErrorDetailsAreRecoveredFromAConnectError(t *testing.T) {
+	bridge := useFakeBridge(t)
+	process := poolBridge(t)
+
+	_, errList := process.cursor.ListModels(context.Background(), connect.NewRequest(&sdkv1.ListModelsRequest{
+		Options: &sdkv1.CursorRequestOptions{ApiKey: "throttled-key"},
+	}))
+	if errList == nil {
+		t.Fatal("expected the throttled key to be rejected")
+	}
+	failure := failureFrom(errList)
+	if failure.HTTPStatus != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want 429", failure.HTTPStatus)
+	}
+	if !failure.Retryable {
+		t.Error("retryable = false, want true because the bridge suggested a retry_after")
+	}
+	if !strings.Contains(failure.Message, "retry after 30s") {
+		t.Errorf("message = %q, want the suggested wait", failure.Message)
+	}
+	_ = bridge
+}
+
+// The bridge rejects any RPC without its per-process token, so a client that loses the header must
+// fail loudly rather than appear to work against an unauthenticated endpoint.
+func TestBridgeRejectsRPCsWithoutTheBearerToken(t *testing.T) {
+	bridge := newFakeBridge()
+	baseURL := serveFakeBridge(t, bridge)
+
+	_, errPing := unauthenticatedClient(baseURL).Ping(context.Background(), connect.NewRequest(&sdkv1.PingRequest{}))
+	if errPing == nil {
+		t.Fatal("expected an unauthenticated ping to be rejected")
+	}
+	if got := connect.CodeOf(errPing); got != connect.CodeUnauthenticated {
+		t.Errorf("code = %v, want unauthenticated", got)
+	}
+}
+
+// The streaming path is the one that has to skip keepalives and unknown update kinds: a keepalive
+// treated as end-of-stream would truncate the answer, and an unknown update kind forwarded as text
+// would corrupt it.
+func TestRunGenerateStreamsTextDeltasOnly(t *testing.T) {
+	bridge := useFakeBridge(t)
 
 	var deltas []string
-	var sawDone bool
-	for event := range events {
-		switch event.Event {
-		case "delta":
-			deltas = append(deltas, event.Text)
-		case "done":
-			sawDone = true
-		case "error":
-			t.Fatalf("unexpected error event: %s", event.errorText())
-		}
+	result, errRun := runGenerate(context.Background(), generateRequest{
+		apiKey:      "good-key",
+		model:       "fake-model",
+		optimizeFor: defaultOptimizeFor,
+		prompt:      "hi",
+	}, func(text string) error {
+		deltas = append(deltas, text)
+		return nil
+	})
+	if errRun != nil {
+		t.Fatalf("runGenerate: %v", errRun)
 	}
 	if strings.Join(deltas, "") != "Hello world" {
 		t.Errorf("deltas = %q, want incremental \"Hello world\"", deltas)
 	}
-	if !sawDone {
-		t.Error("stream ended without a done event")
+	if result.text != "Hello world" {
+		t.Errorf("text = %q, want the terminal result", result.text)
+	}
+	if len(bridge.enableDeltas) != 1 || !bridge.enableDeltas[0] {
+		t.Errorf("enable_deltas = %v, want [true] for a streaming request", bridge.enableDeltas)
+	}
+}
+
+// Dropping the Send stream does not stop a run, so a cancelled request has to issue an explicit
+// CancelRun for the run id the stream reported.
+func TestRunGenerateCancelsTheRunWhenTheCallerGoesAway(t *testing.T) {
+	bridge := newFakeBridge()
+	bridge.hold = make(chan struct{})
+	useFakeBridgeService(t, bridge)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	// CancelRun takes the run id the stream reported, so the cancellation is only meaningful
+	// once the client has read it. The first delta is the proof that it has.
+	streaming := make(chan struct{})
+	go func() {
+		streamed := false
+		_, errRun := runGenerate(ctx, generateRequest{
+			apiKey:      "good-key",
+			model:       "fake-model",
+			optimizeFor: defaultOptimizeFor,
+			prompt:      "hi",
+		}, func(string) error {
+			if !streamed {
+				streamed = true
+				close(streaming)
+			}
+			return nil
+		})
+		finished <- errRun
+	}()
+
+	select {
+	case <-streaming:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run never started streaming")
+	}
+	cancel()
+
+	select {
+	case <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("runGenerate did not return after the caller went away")
+	}
+	// The cancellation is issued before the request returns, so that it reaches the bridge
+	// ahead of the agent teardown that follows it.
+	if cancelled := bridge.cancelledRuns(); len(cancelled) != 1 || cancelled[0] != "run-1" {
+		t.Fatalf("cancelled runs = %v, want [run-1] from the first stream message", cancelled)
+	}
+	if closed := bridge.closedAgents(); len(closed) != 1 {
+		t.Errorf("closed agents = %v, want the abandoned agent torn down", closed)
+	}
+}
+
+func TestResolveModelSelectionFiltersAndBackfillsParameters(t *testing.T) {
+	catalog := []*sdkv1.SdkModel{
+		{
+			Id: "fake-model",
+			Parameters: []*sdkv1.ModelParameterDefinition{{
+				Id:     "reasoning_effort",
+				Values: []*sdkv1.ModelParameterDefinitionValue{{Value: "low"}, {Value: "high"}},
+			}},
+		},
+		{
+			Id: "auto-smart",
+			Parameters: []*sdkv1.ModelParameterDefinition{{
+				Id:     optimizeForParameter,
+				Values: []*sdkv1.ModelParameterDefinitionValue{{Value: "cost"}, {Value: "balanced"}},
+			}},
+		},
+	}
+
+	for _, test := range []struct {
+		name        string
+		model       string
+		requested   []modelParam
+		optimizeFor string
+		wantID      string
+		wantParams  map[string]string
+	}{
+		{
+			name:       "a supported value is forwarded",
+			model:      "fake-model",
+			requested:  []modelParam{{ID: "reasoning_effort", Value: "high"}},
+			wantID:     "fake-model",
+			wantParams: map[string]string{"reasoning_effort": "high"},
+		},
+		{
+			// Cursor rejects an unknown parameter value outright, so it is dropped rather than
+			// forwarded and turned into a failed request.
+			name:       "an unsupported value is dropped",
+			model:      "fake-model",
+			requested:  []modelParam{{ID: "reasoning_effort", Value: "ludicrous"}},
+			wantID:     "fake-model",
+			wantParams: map[string]string{},
+		},
+		{
+			name:       "a parameter the model does not expose is dropped",
+			model:      "fake-model",
+			requested:  []modelParam{{ID: "temperature", Value: "0.2"}},
+			wantID:     "fake-model",
+			wantParams: map[string]string{},
+		},
+		{
+			// The router rejects a request that omits optimize_for, so the configured mode fills
+			// the gap.
+			name:        "the router gets the configured optimize_for",
+			model:       "auto-smart",
+			optimizeFor: "cost",
+			wantID:      "auto-smart",
+			wantParams:  map[string]string{optimizeForParameter: "cost"},
+		},
+		{
+			name:        "an unsupported optimize_for falls back to the first offered value",
+			model:       "auto-smart",
+			optimizeFor: "intelligence",
+			wantID:      "auto-smart",
+			wantParams:  map[string]string{optimizeForParameter: "cost"},
+		},
+		{
+			// A catalog miss must not block generation: the request goes upstream as it came.
+			name:       "an unknown model is forwarded verbatim",
+			model:      "brand-new-model",
+			requested:  []modelParam{{ID: "reasoning_effort", Value: "high"}},
+			wantID:     "brand-new-model",
+			wantParams: map[string]string{"reasoning_effort": "high"},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			selection := resolveModelSelection(catalog, test.model, test.requested, test.optimizeFor)
+			if selection.GetId() != test.wantID {
+				t.Errorf("id = %q, want %q", selection.GetId(), test.wantID)
+			}
+			got := map[string]string{}
+			for _, param := range selection.GetParams() {
+				got[param.GetId()] = param.GetValue()
+			}
+			if len(got) != len(test.wantParams) {
+				t.Fatalf("params = %v, want %v", got, test.wantParams)
+			}
+			for id, want := range test.wantParams {
+				if got[id] != want {
+					t.Errorf("params[%s] = %q, want %q", id, got[id], want)
+				}
+			}
+		})
+	}
+}
+
+// An empty catalog is what a failed ListModels leaves behind, and it must not stop a run.
+func TestResolveModelSelectionWithoutACatalog(t *testing.T) {
+	selection := resolveModelSelection(nil, "fake-model", []modelParam{{ID: "reasoning_effort", Value: "high"}}, "balanced")
+	if selection.GetId() != "fake-model" {
+		t.Errorf("id = %q, want the requested model", selection.GetId())
+	}
+	if len(selection.GetParams()) != 1 {
+		t.Errorf("params = %v, want the request's own parameters", selection.GetParams())
+	}
+}
+
+func TestModelsForAuthReportsTheAccountCatalog(t *testing.T) {
+	useFakeBridge(t)
+
+	raw, errModels := modelsForAuth(mustJSON(t, pluginapi.AuthModelRequest{
+		AuthID:      "cursor-dev.json",
+		StorageJSON: storageJSON("good-key"),
+	}))
+	if errModels != nil {
+		t.Fatalf("modelsForAuth: %v", errModels)
+	}
+	var response pluginapi.ModelResponse
+	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, raw).Result, &response); errUnmarshal != nil {
+		t.Fatalf("decode models: %v", errUnmarshal)
+	}
+	if response.Provider != providerIdentifier {
+		t.Errorf("provider = %q, want %q", response.Provider, providerIdentifier)
+	}
+	if len(response.Models) != 2 {
+		t.Fatalf("models = %+v, want the two catalog entries", response.Models)
+	}
+	first := response.Models[0]
+	if first.ID != "fake-model" || first.DisplayName != "Fake" {
+		t.Errorf("first model = %+v, want fake-model/Fake", first)
+	}
+	// Parameter ids are what the host advertises as supported parameters.
+	if len(first.SupportedParameters) != 1 || first.SupportedParameters[0] != "reasoning_effort" {
+		t.Errorf("supported parameters = %v, want [reasoning_effort]", first.SupportedParameters)
+	}
+}
+
+// A credential whose catalog cannot be read keeps no models, which is what the host reads as
+// "this credential currently serves nothing".
+func TestModelsForAuthReturnsNothingForARejectedKey(t *testing.T) {
+	useFakeBridge(t)
+
+	raw, errModels := modelsForAuth(mustJSON(t, pluginapi.AuthModelRequest{
+		AuthID:      "cursor-dev.json",
+		StorageJSON: storageJSON("bad-key"),
+	}))
+	if errModels != nil {
+		t.Fatalf("modelsForAuth: %v", errModels)
+	}
+	var response pluginapi.ModelResponse
+	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, raw).Result, &response); errUnmarshal != nil {
+		t.Fatalf("decode models: %v", errUnmarshal)
+	}
+	if len(response.Models) != 0 {
+		t.Errorf("models = %+v, want none", response.Models)
+	}
+}
+
+// A local agent rejects a remote image reference, so the plugin has to fetch it and send the bytes.
+func TestBuildSdkImagesInlinesRemoteReferences(t *testing.T) {
+	fetched := ""
+	images, errBuild := buildSdkImages([]chatImage{
+		{Data: base64.StdEncoding.EncodeToString([]byte("inline")), MimeType: "image/jpeg"},
+		{URL: "https://example.com/a.png"},
+	}, func(reference string) (string, string, error) {
+		fetched = reference
+		return base64.StdEncoding.EncodeToString([]byte("downloaded")), "image/png", nil
+	})
+	if errBuild != nil {
+		t.Fatalf("buildSdkImages: %v", errBuild)
+	}
+	if fetched != "https://example.com/a.png" {
+		t.Errorf("fetched = %q, want the remote reference", fetched)
+	}
+	if len(images) != 2 {
+		t.Fatalf("images = %d, want 2", len(images))
+	}
+	for index, want := range []struct{ data, mime string }{
+		{data: "inline", mime: "image/jpeg"},
+		{data: "downloaded", mime: "image/png"},
+	} {
+		data := images[index].GetData()
+		if data == nil {
+			t.Fatalf("images[%d] carries no inline data: %+v", index, images[index])
+		}
+		decoded, errDecode := base64.StdEncoding.DecodeString(data.GetData())
+		if errDecode != nil {
+			t.Fatalf("images[%d] data is not base64: %v", index, errDecode)
+		}
+		if string(decoded) != want.data || data.GetMimeType() != want.mime {
+			t.Errorf("images[%d] = %q/%q, want %q/%q", index, decoded, data.GetMimeType(), want.data, want.mime)
+		}
+	}
+}
+
+// An unfetchable image is the caller's problem, so it must fail the request rather than the
+// credential.
+func TestBuildSdkImagesReportsAFetchFailureAsARequestFault(t *testing.T) {
+	_, errBuild := buildSdkImages([]chatImage{{URL: "https://example.com/gone.png"}},
+		func(string) (string, string, error) { return "", "", errors.New("404") })
+	if errBuild == nil {
+		t.Fatal("expected a fetch failure to be reported")
+	}
+	failure := failureFrom(errBuild)
+	if failure.HTTPStatus != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", failure.HTTPStatus)
+	}
+	if got := gjson.Get(failure.Message, "error.code").String(); got != "image_unavailable" {
+		t.Errorf("error.code = %q, want image_unavailable in %s", got, failure.Message)
+	}
+}
+
+func TestResponseMimeTypeKeepsOnlyImageMediaTypes(t *testing.T) {
+	for _, test := range []struct {
+		contentType string
+		want        string
+	}{
+		{contentType: "image/png", want: "image/png"},
+		// A charset parameter is not part of the media type Cursor is given.
+		{contentType: "image/jpeg; charset=binary", want: "image/jpeg"},
+		// A reference that answers with a web page is not an attachment, so the plugin falls
+		// back to its default rather than declaring a type Cursor would reject.
+		{contentType: "text/html", want: ""},
+		{contentType: "", want: ""},
+	} {
+		if got := responseMimeType(http.Header{"Content-Type": []string{test.contentType}}); got != test.want {
+			t.Errorf("responseMimeType(%q) = %q, want %q", test.contentType, got, test.want)
+		}
+	}
+}
+
+// An image the plugin cannot fetch has to fail the request rather than the credential, and the
+// executor is where that classification has to survive. The host callback is unavailable in a
+// test, which is exactly the failure being classified.
+func TestExecuteReportsAnUnfetchableImageAsARequestFault(t *testing.T) {
+	useFakeBridge(t)
+
+	raw, errExecute := execute(executorRequest(t, "good-key", map[string]any{
+		"messages": []map[string]any{{"role": "user", "content": []map[string]any{
+			{"type": "text", "text": "what is this"},
+			{"type": "image_url", "image_url": map[string]any{"url": "https://example.com/a.png"}},
+		}}},
+	}))
+	if errExecute != nil {
+		t.Fatalf("execute: %v", errExecute)
+	}
+	env := decodeEnvelope(t, raw)
+	if env.OK {
+		t.Fatal("expected an unfetchable image to fail the request")
+	}
+	if env.Error.HTTPStatus != http.StatusBadRequest {
+		t.Errorf("http status = %d, want 400", env.Error.HTTPStatus)
+	}
+	if got := gjson.Get(env.Error.Message, "error.code").String(); got != "image_unavailable" {
+		t.Errorf("error.code = %q, want image_unavailable in %s", got, env.Error.Message)
 	}
 }
 
@@ -437,7 +840,23 @@ func TestParseAuthClaimsOnlyCursorFiles(t *testing.T) {
 	}
 }
 
-func TestCommandLineRegisterDeclaresLoginFlag(t *testing.T) {
+// A credential's own proxy_url wins over the plugin-level fallback, because a pool of accounts
+// routed through different proxies is the case the per-credential field exists for.
+func TestResolveProxyURLPrefersTheCredential(t *testing.T) {
+	useWeights(t, "proxy-url: \"http://fallback:3128\"\n")
+
+	if got := resolveProxyURL([]byte(`{"type":"cursor","api_key":"k","proxy_url":"socks5://127.0.0.1:1080"}`)); got != "socks5://127.0.0.1:1080" {
+		t.Errorf("proxy = %q, want the credential's own proxy", got)
+	}
+	if got := resolveProxyURL([]byte(`{"type":"cursor","api_key":"k"}`)); got != "http://fallback:3128" {
+		t.Errorf("proxy = %q, want the configured fallback", got)
+	}
+	if got := resolveProxyURL(nil); got != "http://fallback:3128" {
+		t.Errorf("proxy = %q, want the configured fallback", got)
+	}
+}
+
+func TestCommandLineRegisterDeclaresLoginFlags(t *testing.T) {
 	raw, errRegister := commandLineRegister()
 	if errRegister != nil {
 		t.Fatalf("commandLineRegister: %v", errRegister)
@@ -446,64 +865,91 @@ func TestCommandLineRegisterDeclaresLoginFlag(t *testing.T) {
 	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, raw).Result, &response); errUnmarshal != nil {
 		t.Fatalf("decode registration: %v", errUnmarshal)
 	}
-	if len(response.Flags) != 1 {
-		t.Fatalf("flags = %+v, want exactly one", response.Flags)
+	types := map[string]string{}
+	for _, flag := range response.Flags {
+		types[flag.Name] = flag.Type
 	}
-	if response.Flags[0].Name != loginFlagName || response.Flags[0].Type != "bool" {
-		t.Errorf("flag = %+v, want bool %s", response.Flags[0], loginFlagName)
+	if types[loginFlagName] != "bool" {
+		t.Errorf("--%s = %q, want bool", loginFlagName, types[loginFlagName])
+	}
+	if types[apiKeyFlagName] != "string" {
+		t.Errorf("--%s = %q, want string", apiKeyFlagName, types[apiKeyFlagName])
+	}
+	if len(response.Flags) != 2 {
+		t.Errorf("flags = %+v, want exactly the two login flags", response.Flags)
 	}
 }
 
-func TestCommandLineExecuteReturnsLoginAuth(t *testing.T) {
-	useFakeSidecar(t)
+func TestReadLoginAPIKeyPrefersTheFlag(t *testing.T) {
+	key, errRead := readLoginAPIKey("  key_from_flag  ")
+	if errRead != nil {
+		t.Fatalf("readLoginAPIKey: %v", errRead)
+	}
+	if key != "key_from_flag" {
+		t.Errorf("key = %q, want the trimmed flag value", key)
+	}
+}
 
-	raw, errExecute := commandLineExecute(mustJSON(t, pluginapi.CommandLineExecutionRequest{
-		Program: "cli-proxy-api",
-		Args:    []string{"--" + loginFlagName},
-		Flags: map[string]pluginapi.CommandLineFlagValue{
-			"no-browser": {Name: "no-browser", Value: "true"},
-		},
-		TriggeredFlags: map[string]pluginapi.CommandLineFlagValue{
-			loginFlagName: {Name: loginFlagName, Type: "bool", Value: "true", Set: true},
-		},
-	}))
-	if errExecute != nil {
-		t.Fatalf("commandLineExecute: %v", errExecute)
+// Without the flag the key is pasted at a prompt, which means it arrives with the newline that
+// submitted it and often with clipboard whitespace.
+func TestReadAPIKeyFromTrimsPastedInput(t *testing.T) {
+	key, errRead := readAPIKeyFrom(strings.NewReader("  key_pasted \nignored second line\n"))
+	if errRead != nil {
+		t.Fatalf("readAPIKeyFrom: %v", errRead)
 	}
-	var response pluginapi.CommandLineExecutionResponse
-	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, raw).Result, &response); errUnmarshal != nil {
-		t.Fatalf("decode execution: %v", errUnmarshal)
+	if key != "key_pasted" {
+		t.Errorf("key = %q, want the trimmed first line", key)
 	}
-	if response.ExitCode != 0 {
-		t.Fatalf("exit code = %d, stderr = %s", response.ExitCode, response.Stderr)
+	if _, errEmpty := readAPIKeyFrom(strings.NewReader("   \n")); errEmpty == nil {
+		t.Error("expected an empty paste to be rejected")
 	}
-	if len(response.Auths) != 1 {
-		t.Fatalf("auths = %+v, want exactly one", response.Auths)
+	// A key pasted without a trailing newline still has to be accepted.
+	if key, errEOF := readAPIKeyFrom(strings.NewReader("key_no_newline")); errEOF != nil || key != "key_no_newline" {
+		t.Errorf("key = %q err = %v, want the key accepted at EOF", key, errEOF)
 	}
+}
+
+// go test runs with stdin detached, which is the same situation as systemd or brew services: there
+// is nowhere to prompt, so the command has to say so instead of blocking or reading nothing.
+func TestReadLoginAPIKeyRequiresATerminalWithoutTheFlag(t *testing.T) {
+	if stdinIsTerminal() {
+		t.Skip("stdin is a terminal in this environment")
+	}
+	_, errRead := readLoginAPIKey("")
+	if errRead == nil {
+		t.Fatal("expected the missing terminal to be reported")
+	}
+	if !strings.Contains(errRead.Error(), apiKeyFlagName) {
+		t.Errorf("error = %q, want a pointer at -%s", errRead, apiKeyFlagName)
+	}
+}
+
+func TestCommandLineExecuteReturnsImportedAuth(t *testing.T) {
+	useFakeBridge(t)
+
+	response := loginExecute(t, "", "key_imported")
 	auth := response.Auths[0]
 	if auth.Provider != providerIdentifier {
 		t.Errorf("provider = %q, want %q", auth.Provider, providerIdentifier)
 	}
-	// The file name is derived from the account so a repeat login replaces its credential.
+	// The file name is derived from the account so a repeat import replaces its credential.
 	if auth.FileName != "cursor-dev.user-cli-example.com.json" || auth.ID != auth.FileName {
 		t.Errorf("file name = %q id = %q, want account-derived name", auth.FileName, auth.ID)
 	}
 	if auth.Label != "Dev.User+cli@example.com" {
 		t.Errorf("label = %q, want the account email", auth.Label)
 	}
-	if got := apiKeyFromStorage(auth.StorageJSON); got != "key_minted" {
-		t.Errorf("stored api key = %q, want key_minted", got)
+	if got := apiKeyFromStorage(auth.StorageJSON); got != "key_imported" {
+		t.Errorf("stored api key = %q, want key_imported", got)
 	}
-	// The minted key is short-lived, so its expiry must reach both the stored credential and
-	// the host's refresh schedule.
-	storedExpiry := expiryFromStorage(auth.StorageJSON)
-	if storedExpiry.IsZero() || !storedExpiry.After(time.Now().UTC()) {
-		t.Errorf("stored expiry = %s, want a future deadline", storedExpiry)
+	// A Cursor API key reports no expiry, so the host is told to leave it alone.
+	if !expiryFromStorage(auth.StorageJSON).IsZero() {
+		t.Errorf("stored expiry = %s, want none", expiryFromStorage(auth.StorageJSON))
 	}
-	if !auth.NextRefreshAfter.Equal(storedExpiry) {
-		t.Errorf("next refresh = %s, want the key expiry %s", auth.NextRefreshAfter, storedExpiry)
+	if !auth.NextRefreshAfter.After(time.Now().UTC().Add(300 * 24 * time.Hour)) {
+		t.Errorf("next refresh = %s, want a far-future deadline", auth.NextRefreshAfter)
 	}
-	// The parser must accept what the login produced, otherwise the saved file would be
+	// The parser must accept what the import produced, otherwise the saved file would be
 	// claimed by nobody on the next startup.
 	parsed, errParse := parseAuth(mustJSON(t, pluginapi.AuthParseRequest{
 		FileName: auth.FileName,
@@ -517,23 +963,51 @@ func TestCommandLineExecuteReturnsLoginAuth(t *testing.T) {
 		t.Fatalf("decode auth response: %v", errUnmarshal)
 	}
 	if !parseResponse.Handled {
-		t.Error("parseAuth declined the credential produced by the login flow")
+		t.Error("parseAuth declined the credential produced by the import")
 	}
 }
 
-// loginExecute runs the login command against the fake sidecar with authDir as the host's
+// A key the account cannot use must not be written to disk, which is the whole point of checking
+// it before saving.
+func TestCommandLineExecuteRejectsAnInvalidKey(t *testing.T) {
+	useFakeBridge(t)
+
+	raw, errExecute := commandLineExecute(mustJSON(t, pluginapi.CommandLineExecutionRequest{
+		Program: "cli-proxy-api",
+		TriggeredFlags: map[string]pluginapi.CommandLineFlagValue{
+			loginFlagName:  {Name: loginFlagName, Type: "bool", Value: "true", Set: true},
+			apiKeyFlagName: {Name: apiKeyFlagName, Type: "string", Value: "bad-key", Set: true},
+		},
+	}))
+	if errExecute != nil {
+		t.Fatalf("commandLineExecute: %v", errExecute)
+	}
+	var response pluginapi.CommandLineExecutionResponse
+	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, raw).Result, &response); errUnmarshal != nil {
+		t.Fatalf("decode execution: %v", errUnmarshal)
+	}
+	if response.ExitCode == 0 {
+		t.Fatalf("exit code = 0, want a failure for a rejected key")
+	}
+	if len(response.Auths) != 0 {
+		t.Errorf("auths = %+v, want none saved", response.Auths)
+	}
+	if !strings.Contains(string(response.Stderr), "Invalid User API Key") {
+		t.Errorf("stderr = %q, want Cursor's reason", response.Stderr)
+	}
+}
+
+// loginExecute runs the import command against the fake bridge with authDir as the host's
 // auth directory, which is where the merge looks for the file it is about to replace.
-func loginExecute(t *testing.T, authDir string) pluginapi.CommandLineExecutionResponse {
+func loginExecute(t *testing.T, authDir, apiKey string) pluginapi.CommandLineExecutionResponse {
 	t.Helper()
 	raw, errExecute := commandLineExecute(mustJSON(t, pluginapi.CommandLineExecutionRequest{
 		Program: "cli-proxy-api",
-		Args:    []string{"--" + loginFlagName},
+		Args:    []string{"--" + loginFlagName, "--" + apiKeyFlagName, apiKey},
 		Host:    pluginapi.HostConfigSummary{AuthDir: authDir},
-		Flags: map[string]pluginapi.CommandLineFlagValue{
-			"no-browser": {Name: "no-browser", Value: "true"},
-		},
 		TriggeredFlags: map[string]pluginapi.CommandLineFlagValue{
-			loginFlagName: {Name: loginFlagName, Type: "bool", Value: "true", Set: true},
+			loginFlagName:  {Name: loginFlagName, Type: "bool", Value: "true", Set: true},
+			apiKeyFlagName: {Name: apiKeyFlagName, Type: "string", Value: apiKey, Set: true},
 		},
 	}))
 	if errExecute != nil {
@@ -552,20 +1026,19 @@ func loginExecute(t *testing.T, authDir string) pluginapi.CommandLineExecutionRe
 	return response
 }
 
-// Renewing a key must not discard the routing settings an operator put in the auth file,
+// Replacing a key must not discard the routing settings an operator put in the auth file,
 // because the host rewrites that file from what this command returns.
 func TestCommandLineExecutePreservesExistingAuthFileSettings(t *testing.T) {
-	useFakeSidecar(t)
+	useFakeBridge(t)
 	authDir := t.TempDir()
 	existing := map[string]any{
-		"type":       providerIdentifier,
-		"api_key":    "key_previous",
-		"email":      "Dev.User+cli@example.com",
-		"expires_at": time.Now().UTC().Add(-time.Hour).Format(time.RFC3339),
-		"label":      "team pool",
-		"prefix":     "cursor-a",
-		"proxy_url":  "socks5://127.0.0.1:1080",
-		"note":       "shared account",
+		"type":      providerIdentifier,
+		"api_key":   "key_previous",
+		"email":     "Dev.User+cli@example.com",
+		"label":     "team pool",
+		"prefix":    "cursor-a",
+		"proxy_url": "socks5://127.0.0.1:1080",
+		"note":      "shared account",
 		"model_aliases": []map[string]string{
 			{"name": "grok-4.3", "alias": "grok-latest"},
 		},
@@ -575,18 +1048,12 @@ func TestCommandLineExecutePreservesExistingAuthFileSettings(t *testing.T) {
 		t.Fatalf("write existing auth file: %v", errWrite)
 	}
 
-	auth := loginExecute(t, authDir).Auths[0]
+	auth := loginExecute(t, authDir, "key_imported").Auths[0]
 	if auth.FileName != fileName {
-		t.Fatalf("file name = %q, want %q so the login replaces the same file", auth.FileName, fileName)
+		t.Fatalf("file name = %q, want %q so the import replaces the same file", auth.FileName, fileName)
 	}
-
-	// The freshly minted credential has to win over everything the old file recorded.
-	if got := apiKeyFromStorage(auth.StorageJSON); got != "key_minted" {
-		t.Errorf("api key = %q, want the newly minted key_minted", got)
-	}
-	expiry := expiryFromStorage(auth.StorageJSON)
-	if expiry.IsZero() || !expiry.After(time.Now().UTC()) {
-		t.Errorf("expiry = %s, want the new future deadline rather than the stale one", expiry)
+	if got := apiKeyFromStorage(auth.StorageJSON); got != "key_imported" {
+		t.Errorf("api key = %q, want the newly imported key", got)
 	}
 
 	// Operator-owned settings have to survive.
@@ -609,12 +1076,15 @@ func TestCommandLineExecutePreservesExistingAuthFileSettings(t *testing.T) {
 	if auth.Label != "team pool" {
 		t.Errorf("auth label = %q, want the preserved label", auth.Label)
 	}
+	if auth.ProxyURL != "socks5://127.0.0.1:1080" {
+		t.Errorf("auth proxy = %q, want the preserved proxy", auth.ProxyURL)
+	}
 }
 
-// A stale expiry recorded under a different spelling must not survive, otherwise a renewed
-// credential could be reported as already expired.
+// An expiry left behind by the old browser login flow must not survive, otherwise a freshly
+// imported credential could be reported as already expired.
 func TestCommandLineExecuteClearsStaleCredentialSpellings(t *testing.T) {
-	useFakeSidecar(t)
+	useFakeBridge(t)
 	authDir := t.TempDir()
 	fileName := "cursor-dev.user-cli-example.com.json"
 	existing := map[string]any{
@@ -628,14 +1098,11 @@ func TestCommandLineExecuteClearsStaleCredentialSpellings(t *testing.T) {
 		t.Fatalf("write existing auth file: %v", errWrite)
 	}
 
-	auth := loginExecute(t, authDir).Auths[0]
-	for _, field := range []string{"apiKey", "expiresAt", "expires_at_ms", "apiKeyExpiresAtMs"} {
+	auth := loginExecute(t, authDir, "key_imported").Auths[0]
+	for _, field := range []string{"apiKey", "expiresAt", "expires_at", "expires_at_ms", "apiKeyExpiresAtMs"} {
 		if gjson.GetBytes(auth.StorageJSON, field).Exists() {
 			t.Errorf("%s survived the merge: %s", field, auth.StorageJSON)
 		}
-	}
-	if expiry := expiryFromStorage(auth.StorageJSON); expiry.IsZero() || !expiry.After(time.Now().UTC()) {
-		t.Errorf("expiry = %s, want the new future deadline", expiry)
 	}
 	if got := gjson.GetBytes(auth.StorageJSON, "prefix").String(); got != "cursor-a" {
 		t.Errorf("prefix = %q, want it preserved alongside the credential reset", got)
@@ -643,7 +1110,7 @@ func TestCommandLineExecuteClearsStaleCredentialSpellings(t *testing.T) {
 }
 
 func TestCommandLineExecuteWithoutExistingFile(t *testing.T) {
-	useFakeSidecar(t)
+	useFakeBridge(t)
 
 	for _, test := range []struct {
 		name    string
@@ -664,12 +1131,12 @@ func TestCommandLineExecuteWithoutExistingFile(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			auth := loginExecute(t, test.authDir(t)).Auths[0]
-			if got := apiKeyFromStorage(auth.StorageJSON); got != "key_minted" {
-				t.Errorf("api key = %q, want key_minted", got)
+			auth := loginExecute(t, test.authDir(t), "key_imported").Auths[0]
+			if got := apiKeyFromStorage(auth.StorageJSON); got != "key_imported" {
+				t.Errorf("api key = %q, want key_imported", got)
 			}
 			if got := gjson.GetBytes(auth.StorageJSON, "email").String(); got != "Dev.User+cli@example.com" {
-				t.Errorf("email = %q, want the account from the login", got)
+				t.Errorf("email = %q, want the account the key belongs to", got)
 			}
 		})
 	}
@@ -938,6 +1405,18 @@ func TestParseAuthRejectsMissingKey(t *testing.T) {
 	if env := decodeEnvelope(t, raw); env.OK {
 		t.Error("expected a keyless cursor auth file to be rejected")
 	}
+}
+
+// poolBridge returns the process the fake harness installed, for tests that talk to it directly.
+func poolBridge(t *testing.T) *bridgeProcess {
+	t.Helper()
+	bridgePool.mu.Lock()
+	defer bridgePool.mu.Unlock()
+	process := bridgePool.procs[""]
+	if process == nil {
+		t.Fatal("no fake bridge is installed in the pool")
+	}
+	return process
 }
 
 func mustJSON(t *testing.T, v any) []byte {

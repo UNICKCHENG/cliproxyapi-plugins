@@ -1,8 +1,9 @@
 // Command cursor implements a CLIProxyAPI provider plugin backed by the Cursor Agent SDK.
 //
 // The plugin exposes the "cursor" provider key through the executor, auth provider and
-// model provider capabilities. Because @cursor/sdk is a Node-only agent SDK, upstream
-// calls are delegated to a long-lived Node sidecar process over NDJSON stdio.
+// model provider capabilities. Cursor publishes no first-party Go SDK, so upstream calls go
+// through the official cursor-sdk-bridge: a local child process speaking the sdk.v1 Connect
+// contract, which the plugin drives with generated protobuf clients.
 package main
 
 /*
@@ -146,7 +147,7 @@ func cliproxyPluginFree(ptr unsafe.Pointer, _ C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
-	stopSidecar()
+	stopBridges()
 }
 
 func handleMethod(method string, request []byte) ([]byte, error) {
@@ -157,7 +158,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		}
 		return okEnvelope(pluginRegistration())
 	case pluginabi.MethodPluginShutdown:
-		stopSidecar()
+		stopBridges()
 		return okEnvelope(struct{}{})
 	case pluginabi.MethodAuthIdentifier, pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(map[string]string{"identifier": providerIdentifier})

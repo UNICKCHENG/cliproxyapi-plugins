@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+
+	sdkv1 "github.com/UNICKCHENG/cliproxyapi-plugins/auth-cursor/go/internal/sdk/v1"
 )
 
 // discoveredCatalog remembers the last successful per-credential discovery so that static
@@ -38,7 +40,7 @@ func modelsForAuth(raw []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.ModelResponse{Provider: providerIdentifier})
 	}
 
-	models, errDiscover := discoverModels(apiKey)
+	models, errDiscover := discoverModels(apiKey, resolveProxyURL(req.StorageJSON))
 	if errDiscover != nil || len(models) == 0 {
 		// The credential keeps no models until a later discovery succeeds, which is what the
 		// host reads as "this credential currently serves nothing".
@@ -60,40 +62,41 @@ func modelsForAuth(raw []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.ModelResponse{Provider: providerIdentifier, Models: models})
 }
 
-func discoverModels(apiKey string) ([]pluginapi.ModelInfo, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	events, release, errCall := callSidecar(ctx, sidecarRequest{Op: "models", APIKey: apiKey})
-	if errCall != nil {
-		return nil, errCall
+// discoverModels asks Cursor which models one credential can reach. Discovery forces a catalog
+// refresh: this is the path whose whole purpose is to report the current list, and the cache it
+// fills is what keeps model resolution off the hot path for subsequent requests.
+func discoverModels(apiKey, proxyURL string) ([]pluginapi.ModelInfo, error) {
+	process, errProcess := acquireBridge(proxyURL)
+	if errProcess != nil {
+		return nil, errProcess
 	}
-	defer release()
-
-	for event := range events {
-		switch event.Event {
-		case "models":
-			models := make([]pluginapi.ModelInfo, 0, len(event.Models))
-			for _, model := range event.Models {
-				if info, ok := modelInfoFromCatalog(model); ok {
-					models = append(models, info)
-				}
-			}
-			return models, nil
-		case "error":
-			return nil, errSidecar(event.errorText())
+	catalog, errCatalog := catalogFor(context.Background(), process, apiKey, true)
+	if errCatalog != nil {
+		return nil, errCatalog
+	}
+	models := make([]pluginapi.ModelInfo, 0, len(catalog))
+	for _, model := range catalog {
+		if info, ok := modelInfoFromCatalog(model); ok {
+			models = append(models, info)
 		}
 	}
-	return nil, errSidecar("cursor sidecar closed the stream before returning models")
+	return models, nil
 }
 
-func modelInfoFromCatalog(model sidecarModel) (pluginapi.ModelInfo, bool) {
-	id := strings.TrimSpace(model.ID)
+func modelInfoFromCatalog(model *sdkv1.SdkModel) (pluginapi.ModelInfo, bool) {
+	id := strings.TrimSpace(model.GetId())
 	if id == "" {
 		return pluginapi.ModelInfo{}, false
 	}
-	displayName := strings.TrimSpace(model.DisplayName)
+	displayName := strings.TrimSpace(model.GetDisplayName())
 	if displayName == "" {
 		displayName = id
+	}
+	parameters := make([]string, 0, len(model.GetParameters()))
+	for _, parameter := range model.GetParameters() {
+		if parameterID := strings.TrimSpace(parameter.GetId()); parameterID != "" {
+			parameters = append(parameters, parameterID)
+		}
 	}
 	return pluginapi.ModelInfo{
 		ID:                         id,
@@ -102,16 +105,10 @@ func modelInfoFromCatalog(model sidecarModel) (pluginapi.ModelInfo, bool) {
 		Type:                       "chat",
 		DisplayName:                displayName,
 		Name:                       id,
-		Description:                strings.TrimSpace(model.Description),
+		Description:                strings.TrimSpace(model.GetDescription()),
 		SupportedGenerationMethods: []string{"chat"},
 		SupportedInputModalities:   []string{"text", "image"},
 		SupportedOutputModalities:  []string{"text"},
-		SupportedParameters:        model.Parameters,
+		SupportedParameters:        parameters,
 	}, true
 }
-
-type sidecarError string
-
-func (e sidecarError) Error() string { return string(e) }
-
-func errSidecar(message string) error { return sidecarError(message) }
