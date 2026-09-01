@@ -171,7 +171,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodAuthLoginPoll:
 		return loginPoll()
 	case pluginabi.MethodModelStatic:
-		return staticModels()
+		return staticModels(request)
 	case pluginabi.MethodModelForAuth:
 		return modelsForAuth(request)
 	case pluginabi.MethodExecutorExecute:

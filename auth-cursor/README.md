@@ -1,32 +1,36 @@
 # auth-cursor
 
-Exposes Cursor models through CLIProxyAPI's OpenAI, Claude and Gemini compatible endpoints.
+Exposes Cursor models through CLIProxyAPI's OpenAI, Claude and Gemini compatible
+endpoints.
 
 Two names matter here and they are not the same:
 
-- the **plugin ID** is `auth-cursor` — used for the store API and the `plugins.configs` key;
-- the **provider key** is `cursor` — used by credentials (`"type": "cursor"`), the
-  `--cursor-login` flag, and `owned_by` on `/v1/models`.
+- the **plugin ID** is `auth-cursor` — store API, `plugins.configs` key, library
+  file stem;
+- the **provider key** is `cursor` — auth files (`"type": "cursor"`),
+  `--cursor-login`, `owned_by` on `/v1/models`, and host blocks such as
+  `oauth-model-alias` / `oauth-excluded-models`.
 
-Cursor's SDK is an *agent* SDK, not a chat-completions API, and Cursor publishes no Go
-client for it. Instead it publishes the [SDK Bridge](https://cursor.com/docs/sdk/bridge): a
-local process that embeds the TypeScript SDK and exposes it over the `sdk.v1`
-Connect/protobuf contract. So the plugin ships:
+Cursor's SDK is an *agent* SDK, not a chat-completions API, and Cursor publishes
+no Go client for it. Instead it publishes the
+[SDK Bridge](https://cursor.com/docs/sdk/bridge): a local process that embeds
+the TypeScript SDK and exposes it over the `sdk.v1` Connect/protobuf contract.
+The plugin ships:
 
-- a C-ABI shared library (`auth-cursor.dylib` / `.so` / `.dll`) that the host loads and that
-  declares the `executor`, `auth_provider`, `model_provider` and `command_line_plugin`
-  capabilities;
-- generated `sdk.v1` clients, and the process management that starts `cursor-sdk-bridge`,
-  completes its startup handshake and shuts it down again.
+- a C-ABI shared library (`auth-cursor.dylib` / `.so` / `.dll`) that the host
+  loads, declaring `executor`, `auth_provider`, `model_provider` and
+  `command_line_plugin`;
+- generated `sdk.v1` clients, and the process management that starts
+  `cursor-sdk-bridge`, completes its handshake, and shuts it down.
 
-The bridge binary is not bundled. On first use the plugin downloads the pinned release,
-verifies it against a checksum compiled into the library, and unpacks it into the user cache
-directory. **There is no Node.js or npm prerequisite** — that was the previous
-implementation, which ran a Node sidecar.
+The bridge binary is not bundled. On first use the plugin downloads the pinned
+release, verifies a checksum compiled into the library, and unpacks it into the
+user cache. **No Node.js or npm** — earlier versions ran a Node sidecar; this
+one does not.
 
-Each request creates a one-shot agent with an empty working directory and an empty tool
-list, so the agent can only answer with text. That reduces an agent run to plain model
-inference, which is what a proxy request means.
+Each request creates a one-shot agent with an empty working directory and an
+empty tool list, so the agent can only answer with text. That reduces an agent
+run to plain model inference, which is what a proxy request means.
 
 ```
 client (OpenAI/Claude/Gemini)
@@ -38,115 +42,140 @@ client (OpenAI/Claude/Gemini)
 
 ## Install
 
-The full end-to-end guide — store source, installation, credentials, and first request — is
-in the [repository README](../README.md#install-auth-cursor).
+### Prerequisites
 
-This document covers configuration and behaviour after the plugin is installed.
+- CLIProxyAPI built with CGO. Management responses carry
+  `X-CPA-SUPPORT-PLUGIN: 1` when the binary supports dynamic plugins.
+- A management key (`remote-management.secret-key`). Plugins are installed
+  through the management API.
+- A Cursor API key from the [Cursor dashboard](https://cursor.com/dashboard)
+  (personal) or a team service-account key.
+- Network access to GitHub releases on first use, for the bridge download.
 
-## Configure
+### Store install
 
-[config.example.yaml](config.example.yaml) is a complete host configuration you can copy
-from. The block that matters is:
+Store source URLs must be `https`. Under Homebrew / launchd / systemd, use an
+**absolute** `plugins.dir` — relative `"plugins"` or `~` is resolved against
+`/`, which is read-only.
 
 ```yaml
 plugins:
   enabled: true
-  dir: "plugins"
+  dir: "/Users/<you>/.cli-proxy-api/plugins"
+  store-sources:
+    - "https://raw.githubusercontent.com/UNICKCHENG/cliproxyapi-plugins/main/registry.json"
   configs:
     auth-cursor:
       enabled: true
-      # Leave empty to download the pinned cursor-sdk-bridge on first use.
-      bridge-path: ""
-      # Proxy for credentials whose auth file sets no proxy_url.
-      proxy-url: ""
-      # Cursor Router mode applied to the auto-smart model: cost | balanced | intelligence.
+      bridge-path: ""     # empty downloads the pinned cursor-sdk-bridge on first use
+      proxy-url: ""       # host-level proxy-url does not apply to Cursor traffic
       optimize-for: "balanced"
-      # Per-credential share for weighted-round-robin routing. See "Load balancing".
       weights: {}
 ```
+
+A full copy-paste host config is in [config.example.yaml](config.example.yaml).
+Restart the host, then:
+
+```bash
+# Confirm the source is listed and not in source_errors
+curl -H "Authorization: Bearer $MANAGEMENT_KEY" \
+  localhost:8317/v0/management/plugin-store
+
+curl -X POST -H "Authorization: Bearer $MANAGEMENT_KEY" \
+  "localhost:8317/v0/management/plugin-store/auth-cursor/install"
+
+curl -H "Authorization: Bearer $MANAGEMENT_KEY" \
+  localhost:8317/v0/management/plugins
+```
+
+Expect `"registered": true` and `"effective_enabled": true`. The store writes a
+**versioned** library, for example
+`plugins/darwin/arm64/auth-cursor-v2.0.0.dylib`. That is the file the host
+loads after a store install — not `auth-cursor.dylib`.
+
+The install never flips `plugins.enabled`; set that yourself.
+
+### First request
+
+```bash
+./cli-proxy-api --cursor-login
+Paste your Cursor API key (https://cursor.com/dashboard): key_...
+
+./cli-proxy-api &
+curl -H "Authorization: Bearer $API_KEY" localhost:8317/v1/models
+curl -H "Authorization: Bearer $API_KEY" localhost:8317/v1/chat/completions \
+  -d '{"model":"composer-2.5","messages":[{"role":"user","content":"hi"}]}'
+```
+
+The first run after an install or upgrade downloads `cursor-sdk-bridge` before
+the prompt — tens of megabytes, once per bridge version. Later runs reuse
+`<cache>/cli-proxy-api/auth-cursor-bridge/<bridge-version>/`.
+
+## Configure
+
+The plugin-owned block is `plugins.configs.auth-cursor`:
 
 | Option | Purpose |
 | --- | --- |
 | `bridge-path` | The `cursor-sdk-bridge` executable, or the directory holding it. Empty means the automatic download. |
 | `proxy-url` | Proxy for credentials whose auth file has no `proxy_url`. See [Proxying](#proxying). |
-| `optimize-for` | Router mode for the `auto-smart` model: `cost`, `balanced`, or `intelligence`. |
+| `optimize-for` | Router mode for `auto-smart`: `cost`, `balanced`, or `intelligence`. |
 | `weights` | Per-credential share for weighted routing, keyed by account email or auth file name. |
 
-When the host runs under a service manager, prefer an absolute path for `plugins.dir`: the
-working directory of a launchd or systemd unit differs from an interactive shell.
+Model aliases and exclusions are **host-level**, keyed by `cursor`, not by the
+plugin ID, and **not** inside `plugins.configs`. See [Models](#models).
 
 ### The bridge binary
 
-The plugin looks for the bridge in this order, most explicit first:
+Lookup order, most explicit first:
 
 1. `CURSOR_SDK_BRIDGE_BIN`, an absolute path to the executable;
 2. `bridge-path` from the config, either the executable or the directory holding it;
 3. the copy already unpacked at
    `<cache>/cli-proxy-api/auth-cursor-bridge/<bridge-version>/bin/cursor-sdk-bridge`
-   (`~/Library/Caches` on macOS, `~/.cache` or `$XDG_CACHE_HOME` on Linux, `%LocalAppData%`
-   on Windows);
+   (`~/Library/Caches` on macOS, `~/.cache` or `$XDG_CACHE_HOME` on Linux,
+   `%LocalAppData%` on Windows);
 4. a download of the pinned release from GitHub.
 
-The download is verified against a SHA-256 that ships inside the plugin, not against the
-checksum file published beside the archive: a checksum served from the same place as the
-archive it describes proves only that the two agree. A mismatch aborts the install and
+The download is verified against a SHA-256 that ships inside the plugin, not
+against the checksum file published beside the archive. A mismatch aborts and
 leaves nothing behind.
 
-Pinned to one bridge version deliberately — the `sdk.v1` contract the plugin is generated
-against comes from that same release. If GitHub is unreachable from the host, download
-`cursor-sdk-bridge-standalone-<platform>.tar.gz` from
-[cursor/sdk-bridge releases](https://github.com/cursor/sdk-bridge/releases) elsewhere,
+Pinned to one bridge version deliberately — the `sdk.v1` contract the plugin is
+generated against comes from that same release. If GitHub is unreachable,
+download `cursor-sdk-bridge-standalone-<platform>.tar.gz` from
+[cursor/sdk-bridge releases](https://github.com/cursor/sdk-bridge/releases),
 unpack it, and point `bridge-path` at it.
 
-One bridge process is started per proxy, shared by every credential that uses it, and each
-gets a private empty workspace directory. Durable agent state lives under
-`<cache>/cli-proxy-api/auth-cursor-bridge/<plugin-version>/state/`; the plugin deletes each
-one-shot agent after its request, so that directory does not grow with traffic.
+One bridge process is started per proxy, shared by every credential that uses
+it, and each gets a private empty workspace. Durable agent state lives under
+`<cache>/cli-proxy-api/auth-cursor-bridge/<plugin-version>/state/`; the plugin
+deletes each one-shot agent after its request.
 
 ## Credentials
 
-A Cursor credential is an API key you create yourself: a personal key in the
-[Cursor dashboard](https://cursor.com/dashboard), or a team service-account key. There is no
-browser sign-in — `sdk.v1` exposes no login endpoint, and earlier versions of this plugin
-minted keys through a flow that is no longer available to it.
-
-### Import from the command line
-
-The plugin registers `--cursor-login` on the host binary. It prompts for the key, checks it,
-and writes the auth file:
+A Cursor credential is an API key you create yourself. There is no browser
+sign-in — `sdk.v1` exposes no login endpoint.
 
 ```bash
 ./cli-proxy-api --cursor-login
-Paste your Cursor API key (https://cursor.com/dashboard): key_...
-```
-
-The key is checked against Cursor before anything is saved, so a mistyped key fails here
-instead of at the first request. The account email that check returns names the file —
-`cursor-<account>.json` in `auth-dir` — so importing a key for the same account replaces
-that file rather than adding a duplicate. The command exits without starting the server.
-
-For scripts and CI, pass the key as an argument instead:
-
-```bash
+# scripts / brew services (no TTY):
 ./cli-proxy-api --cursor-login --cursor-api-key "key_..."
 ```
 
-Prefer the prompt when a person is present: an argument is visible in the process list and
-in shell history. The import never reads the key from the environment, so nothing is picked
-up from an ambient `CURSOR_API_KEY`.
+The key is checked against Cursor before anything is saved. The account email
+that check returns names the file — `cursor-<account>.json` in `auth-dir` —
+so importing a key for the same account replaces that file. The command exits
+without starting the server.
 
-Under a service manager, or with stdin redirected, there is no terminal to prompt on and the
-command says so — use `--cursor-api-key` there.
+Prefer the prompt when a person is present: an argument is visible in the
+process list and in shell history. The import never reads `CURSOR_API_KEY`.
 
-Re-importing does not cost you the settings you added to that file. The plugin reads the file
-it is about to replace and carries over everything it does not own — `label`, `prefix`,
-`proxy_url`, `disabled`, `note`, `model_aliases`, `excluded-models` and any custom field —
-while the key itself is replaced.
+Re-importing keeps settings the plugin does not own: `label`, `prefix`,
+`proxy_url`, `disabled`, `note`, `model_aliases`, `excluded-models`, and any
+custom field.
 
-### Writing the auth file yourself
-
-The import is a convenience. An auth file in `auth-dir`, for example
-`auths/cursor-main.json`, works exactly the same:
+You can also write the file yourself:
 
 ```json
 {
@@ -155,24 +184,17 @@ The import is a convenience. An auth file in `auth-dir`, for example
 }
 ```
 
-`type` is the provider key `cursor`, not the plugin ID `auth-cursor`.
+`type` is `cursor`, not `auth-cursor`. Optional fields: `label`, `prefix`,
+`proxy_url`, `disabled`, `note`, `model_aliases`, `excluded-models`.
 
-Optional fields: `label`, `prefix`, `proxy_url`, `disabled`, `note`, and the per-account
-`model_aliases` / `excluded-models` lists described under [Models](#models).
-
-Dashboard keys carry no expiry the plugin can read, so they are re-checked only for
-presence. A key revoked in the dashboard starts failing with 401 at request time. Auth files
-written by the old login flow may carry `expires_at`; it is still honoured, and re-importing
-clears it.
-
-There is no `cursor-api-key` config field. A key is a credential, and credentials live in
-`auth-dir` where the host can schedule several of them.
+Dashboard keys carry no expiry the plugin can read. A key revoked in the
+dashboard starts failing with 401 at request time. There is no
+`cursor-api-key` config field — keys live in `auth-dir`.
 
 ### Load balancing
 
-Add one file per key to spread traffic across credentials; the host schedules them like any
-other provider. To give some accounts a larger share, switch the host to the weighted
-strategy and list the shares in the plugin config:
+One file per key. To weight accounts, set `routing.strategy:
+weighted-round-robin` and list shares in the plugin config:
 
 ```yaml
 routing:
@@ -187,74 +209,47 @@ plugins:
         cursor-service-account.json: 1
 ```
 
-Each key is matched case-insensitively against the credential's `email` first, then the auth
-file name with and without the `.json` suffix. A credential you do not list keeps the host
-default share of 1. A share of `0` — or any negative value — parks the credential while the
-weighted strategy is active. The maximum is 1000000, and a value the host would reject fails
-the config load rather than surfacing later as a routing error.
+Keys match the credential `email` first, then the auth file name with and
+without `.json`, case-insensitively. Omitted credentials keep share 1. `0` or
+a negative value parks the credential. The maximum is 1000000.
 
-Weights are configured here rather than in the auth file for a reason: `--cursor-login`
-rewrites that file. Do not set `weight` in the auth file as well. The host lets a file-level
-`weight` override whatever the plugin resolved, so a leftover one silently wins and then
-disappears on the next import.
-
-Editing `weights` takes effect through the host's normal config reload; no restart is needed.
+Do not also set `weight` in the auth file: `--cursor-login` rewrites that file,
+and a leftover file-level `weight` silently wins. Editing `weights` takes
+effect on the host's normal config reload.
 
 ## Proxying
 
-Cursor traffic does not pass through the host's HTTP client any more: the bridge reaches
-Cursor itself. The **host-level `proxy-url` therefore has no effect on it** — set the proxy
-under `plugins.configs.auth-cursor` as well, or per credential.
+The bridge reaches Cursor itself. The **host-level `proxy-url` has no effect**
+on that traffic — set `plugins.configs.auth-cursor.proxy-url`, or `proxy_url`
+in the auth file.
 
-The plugin resolves one proxy per credential — the auth file's `proxy_url` first, then the
-plugin's `proxy-url` — and starts one bridge process per resolved proxy. A proxy already
-present in the host's own environment is used when the plugin has none of its own, so a
-machine that only reaches the internet through a proxy keeps working.
+Per credential: auth-file `proxy_url` first, then the plugin `proxy-url`. One
+bridge process per resolved proxy. A proxy already in the host environment is
+used when the plugin has none of its own.
 
-Applying that proxy is the plugin's job rather than the bridge's. The bridge's runtime issues
-its Cursor calls on an HTTP agent that ignores `HTTP_PROXY` and friends, so the plugin starts
-a small reverse proxy on loopback next to each bridge, points the bridge's Cursor endpoint at
-it, and makes the outbound connection in Go, where the proxy is honoured — including
-`socks5://`. The listener accepts only loopback connections, lives and dies with its bridge,
-and is skipped entirely when there is no proxy to apply, so a direct or TUN setup is
-unaffected. The proxy environment variables are still handed to the bridge, because they do
-reach the parts of the SDK that go through its runtime's own `fetch()`.
-
-If the proxy cannot be dialled, the bridge fails to start and says why; a proxy that accepts
-connections but cannot reach Cursor shows up as `cursor egress request failed` in the log,
-and requests report `could not reach the cursor api`.
-
-Image attachments are the exception: a remote image URL is fetched through the host's HTTP
-client and sent to Cursor as inline bytes, because `sdk.v1` accepts image references only for
-cloud-routed agents.
+The bridge's HTTP agent ignores `HTTP_PROXY`, so the plugin starts a loopback
+reverse proxy next to each bridge and dials out in Go — including `socks5://`.
+Skipped when there is no proxy. Image URLs are the exception: they are fetched
+through the host HTTP client and sent as inline bytes.
 
 ## Models
 
-Model availability is per account and per team, so the plugin asks Cursor for the catalog
-with each credential instead of hard-coding a list. Whatever that key can reach shows up on
-`/v1/models`: Composer, Grok, and the OpenAI, Anthropic and Google models in the Cursor
-usage pool. Cursor Router appears as `auto-smart` when the team has it enabled.
+Availability is per account. The plugin asks Cursor for the catalog with each
+credential. Whatever that key can reach shows up on `/v1/models`: Composer,
+Grok, and the OpenAI / Anthropic / Google models in the Cursor usage pool.
+Cursor Router appears as `auto-smart` when the team has it enabled. Some
+catalogs also include a legacy `default` id.
 
-`optimize-for` is applied automatically to `auto-smart`, which rejects requests that omit it.
-Other per-model parameters are checked against the catalog and dropped when the selected
-model does not expose them, so a `reasoning_effort` sent to a model that has no such
-parameter is ignored rather than rejected upstream.
+`optimize-for` is applied automatically to `auto-smart`. Other per-model
+parameters are dropped when the selected model does not expose them.
 
-Models are matched by id only. The TypeScript SDK's catalog also carried an alias list per
-model, which the previous implementation accepted as request ids; `sdk.v1` has no such field,
-so a second name for a model now has to come from the host's `oauth-model-alias` block
-below.
-
-Discovery is the only source of the catalog; there is no model list to configure. When it
-fails for a credential the plugin publishes nothing for that key, so `/v1/models` carries no
-Cursor entries until a later discovery succeeds. A catalog that cannot be read does not block
-generation: the requested model id is forwarded as-is and Cursor decides.
+Matching is by id only. Discovery is the only source of the list. A failed
+discovery publishes nothing for that key; generation still forwards the
+requested id and Cursor decides.
 
 ### Renaming and hiding models
 
-Cursor credentials are OAuth-kind credentials as far as the host is concerned, so the
-host-level alias and exclusion blocks apply to them. Both are keyed by the provider key
-`cursor`, not by the plugin ID, and both live outside `plugins.configs`:
+Both blocks are host-level, keyed by `cursor`, **outside** `plugins.configs`:
 
 ```yaml
 oauth-model-alias:
@@ -266,139 +261,199 @@ oauth-model-alias:
 
 oauth-excluded-models:
   cursor:
-    - "grok-4.5"
+    - "default"
 ```
 
-These apply to every Cursor credential. To scope a rename or an exclusion to one account,
-put `model_aliases` / `excluded-models` in that account's auth file instead; the per-account
-list is consulted first and wins over the global block.
+That YAML is the correct form. It is not plugin config. A value nested under
+`plugins.configs.auth-cursor` is ignored.
+
+Exclusions match model **ids** case-insensitively; `*` is a substring wildcard.
+`default` and `auto-smart` are different ids — hiding Auto/Router requires
+`- "auto-smart"` as well.
+
+Per-account: put `model_aliases` / `excluded-models` in that auth file. The
+per-account list is consulted first and wins over the global block.
+
+After editing, let the host reload the config (file watcher) or restart it.
+The running plugin must be a build that applies these lists on
+`model.static` / `model.for_auth` — store 2.0.0 did not filter `/v1/models`.
 
 ## Behaviour and limits
 
-- **Agent semantics, not raw inference.** Even when you select a Claude or GPT model, the
-  request runs through the Cursor agent harness and bills against the Cursor usage pool.
-  It is not a direct Anthropic or OpenAI API call.
-- **Stateless.** Every request builds a fresh agent from the full message list; conversation
-  state is not retained between requests.
-- **Latency.** Agent creation adds overhead, so time-to-first-token is higher than a native
-  inference API.
-- **A cancelled request cancels the run.** Dropping the bridge stream does not stop a run —
-  Cursor keeps executing and billing it — so an abandoned request explicitly cancels the run
-  the stream reported, then deletes the agent.
-- **No token counting endpoint.** `count_tokens` returns a character-based estimate; billing
-  uses the counts Cursor reports after a run.
+- **Agent semantics, not raw inference.** Claude or GPT selections still run
+  through the Cursor agent harness and bill the Cursor usage pool.
+- **Stateless.** Every request builds a fresh agent from the full message list.
+- **Latency.** Agent creation adds overhead versus a native inference API.
+- **A cancelled request cancels the run.** Dropping the stream does not stop
+  Cursor; the plugin issues an explicit cancel, then deletes the agent.
+- **No token counting endpoint.** `count_tokens` is a character estimate;
+  billing uses counts Cursor reports after a run.
 - **No raw HTTP passthrough.** `executor.http_request` returns 501.
-- **Upstream failures are classified before the host sees them.** A rejected key, a rate
-  limit and a server error each get the handling they deserve. Refusals that are properties
-  of the request — a model the account's region or plan cannot reach — are reported as
-  request faults, so they fail that one request without parking the credential for every
-  other model.
-- **Stream framing depends on the caller.** Chat-completions clients receive chunks that the
-  host frames itself, while other protocols go through a response translator that requires
-  `data:` frames. The executor picks the framing from the inbound request path; without it,
-  one of the two paths gets malformed SSE.
+- **Upstream failures are classified** before the host sees them. Region/plan
+  refusals fail that one request without parking the credential.
+- **Stream framing depends on the caller.** Chat-completions vs translated
+  protocols need different SSE; the executor picks from the inbound path.
 
 ## Usage and compliance
 
-The plugin only uses Cursor's published SDK Bridge contract and keys you create yourself, so
-it does not touch private endpoints or credentials belonging to the Cursor editor. How you
-operate it still matters, because every request bills a real Cursor account:
+The plugin only uses Cursor's published SDK Bridge and keys you create
+yourself. Every request still bills a real Cursor account:
 
-- **Do not share one account's key with other people.** Exposing this proxy to others on
-  your own credential is account sharing, which Cursor's terms prohibit. Give each person
-  their own key, or use a team service-account key.
-- **Do not resell or publicly redistribute Cursor access** obtained through this plugin.
-- **Expect rate limiting under automated load.** Rotating several credentials spreads usage,
-  but each one still draws on a real account's quota.
+- Do not share one account's key with other people.
+- Do not resell or publicly redistribute Cursor access obtained through this
+  plugin.
+- Expect rate limiting under automated load.
 
-Review Cursor's current terms before deploying; this document is not legal advice.
+Review Cursor's current terms before deploying; this is not legal advice.
 
 ## Logging
-
-Every finished request writes one line to the host log, so Cursor traffic is searchable the
-same way a built-in channel's is:
 
 ```bash
 grep 'cursor request' ~/.cli-proxy-api/logs/main.log
 ```
 
-A completed request carries `auth_id`, `auth_label`, `model`, `stream`, `latency_ms`, the
-token counts Cursor reported (`input_tokens`, `output_tokens`, `total_tokens`) and, for
-streams, `ttft_ms`. A failed one carries `failed=true` and the classified error message
-instead. The prompt, the response and the API key are never logged.
+A completed line carries `auth_id`, `auth_label`, `model`, `stream`,
+`latency_ms`, token counts, and for streams `ttft_ms`. A failed one carries
+`failed=true`. The prompt, response and API key are never logged.
 
-Host usage statistics are unaffected by the plugin boundary. A Cursor call is reported under
-the provider key `cursor` together with the credential that served it, its latency, its time to
-first token and its token counts, so per-credential attribution in the management API and the
-dashboard works the same as for a built-in channel.
-
-What differs is `request-log: true`. It records the **client** side of the call as usual, but
-its upstream section stays empty for Cursor: the request reaches the SDK bridge over Connect
-instead of the host's HTTP path, so there is no host-issued HTTP request to capture. If a Web
-UI builds its request view out of that upstream section, Cursor traffic will be missing from
-it. That is a host-side behaviour the plugin cannot change; the log lines above are the
-per-request record to use meanwhile.
-
-Web UI clients keep their own conversation history locally; they do not read these logs.
-
-## Troubleshooting
-
-| Symptom | Cause |
-| --- | --- |
-| Plugin missing from `/v0/management/plugins` | `plugins.enabled` is off, or `plugins.dir` does not resolve — use an absolute path under a service manager |
-| `"registered": false` | The library failed to load; the host binary may lack CGO plugin support |
-| `create plugin directory: mkdir plugins: read-only file system` (or `mkdir ~: …`) | Relative `plugins.dir` or a literal `~` is resolved against the Homebrew/launchd CWD (`/`). Use `/Users/<you>/.cli-proxy-api/plugins`. See [CLIProxyAPI #4313](https://github.com/router-for-me/CLIProxyAPI/issues/4313). |
-| `download …/cursor-sdk-bridge-standalone-…tar.gz` fails | The host cannot reach GitHub releases. Download the archive elsewhere, unpack it, and set `bridge-path`. |
-| `verify …: sha256 mismatch` | The downloaded archive is not the pinned release — a proxy or mirror rewrote it. Nothing was installed; fix the network path or set `bridge-path`. |
-| `cursor sdk bridge was not ready within 30s` | The bridge started but never announced its port. The log line `cursor sdk bridge stderr` carries its own diagnostics. |
-| `cursor sdk bridge exited before it was ready` | The binary could not run at all — wrong platform archive, or a `bridge-path` pointing at something else. |
-| `cursor login failed: could not reach the cursor api` | The bridge started but its Cursor call never completed. The host-level `proxy-url` does not apply here — set one under `plugins.configs.auth-cursor` too, and confirm it works: `curl -x <proxy> -I --max-time 15 https://api2.cursor.sh`. See [Proxying](#proxying). |
-| `cursor egress request failed` in the log | The configured proxy accepted the connection but could not reach Cursor. The log line carries the proxy's own error. |
-| `/v1/models` has no Cursor entries | Discovery failed for that credential; check the `cursor model discovery failed` log line for the reason |
-| `cursor upstream error 401: Invalid User API Key` | The key is rejected or revoked; the host then parks the credential, so later requests report `auth_unavailable` instead of repeating the 401 |
-| `Model not available … not supported in your region` | The account's region or plan cannot reach that model — typically the Claude and GPT entries. Only the requested model is refused; the credential keeps serving the rest. Hide the unreachable ids with `oauth-excluded-models.cursor`, or per account with `excluded-models` in the auth file. |
-| Every Cursor request reports `503 auth_unavailable` after one model failed | An unclassified upstream failure parks the credential for a cooldown window. Check `~/.cli-proxy-api/logs/main.log` for the `upstream execution failed` line naming the real cause; `disable-cooling: true` is an emergency escape while you fix it. |
-| Hundreds of `auth-cursor-sidecar/.../package.json` credentials in the management panel | Version 1.0.0 and earlier bootstrapped a Node sidecar into `~/.cli-proxy-api`, which is the default `auth-dir`, so every npm manifest was scanned as a credential. This version runs no sidecar; delete `~/.cli-proxy-api/auth-cursor-sidecar/` by hand. |
+Host usage statistics report provider `cursor` with the credential that served
+the call. `request-log: true` records the client side; the upstream HTTP
+section stays empty because the call goes over Connect, not the host HTTP
+client.
 
 ## Development
 
-Building from source: see the [repository README](../README.md#building-from-source).
+Needs a CGO-capable Go toolchain. Generated `sdk.v1` clients are committed;
+building does not need `buf` unless you regenerate.
 
 ```bash
-make build          # dist/auth-cursor.<ext>
 make fmt
 make test
-make proto          # only when the pinned bridge release changes
+make build                        # dist/auth-cursor.<ext>
+make proto                        # only when the pinned bridge release changes
 ```
 
-The tests drive the plugin against an in-process fake `sdk.v1` service, so they need no
-Cursor credential, no bridge binary and no network access. They cover the startup handshake
-including its timeout and failure paths, discovery validation, process pooling per proxy,
-the bearer token the bridge requires, bridge download verification and archive extraction
-safety, the egress proxy's host routing and stream flushing, run streaming and keepalive
-handling, run cancellation, agent teardown, error-code classification, model parameter
-filtering and `optimize_for` backfill, image inlining, prompt flattening, completion and
-stream chunk assembly, per-protocol stream framing, the per-request log fields, auth file
-claiming, weight resolution, and the `--cursor-login` import including the settings it carries
-over.
-
-The startup contract itself — the ready line, the discovery payload, the bearer token — can be
-checked against the real binary, which needs no Cursor credential:
+Tests use an in-process fake `sdk.v1` service: no Cursor key, no bridge, no
+network.
 
 ```bash
-cd go && CURSOR_SDK_BRIDGE_BIN=/path/to/cursor-sdk-bridge go test -run TestLiveBridgeHandshake ./...
+cd go && CURSOR_SDK_BRIDGE_BIN=/path/to/cursor-sdk-bridge \
+  go test -run TestLiveBridgeHandshake ./...
 ```
 
-`sdk.v1` is vendored under [proto/](proto) exactly as the pinned bridge release publishes it,
-and the generated clients under `go/internal/` are committed, so building needs nothing but
-the Go toolchain. Regenerating needs [buf](https://buf.build) with `protoc-gen-go` and
-`protoc-gen-connect-go` on PATH.
+### Installing a local build
 
-Bumping the bridge: replace `proto/`, update `bridgeVersion` and the checksums in
-`go/bridge_release.go`, run `make proto`, and check the generated diff. The three move
-together — the contract the plugin is generated against belongs to the release it drives.
+`make install INSTALL_DIR=/path/to/plugins` copies **only**
+`auth-cursor.<ext>`. After a store install the host loads the **versioned**
+name instead.
 
-Also re-check the two things the egress in `go/bridge_egress.go` reads off the release, since
-neither is part of the published contract: that `CURSOR_BACKEND_URL` still redirects the
-bridge's Cursor calls, and that the hosts it defaults to are still the ones the egress routes
-to. Both are visible as strings in the bridge executable.
+Homebrew example (`plugins.dir` = `~/.cli-proxy-api/plugins`, store version
+2.0.0):
+
+```bash
+make build
+# overwrite both names so a store-configured host actually loads the new bits
+cp dist/auth-cursor.dylib ~/.cli-proxy-api/plugins/darwin/arm64/auth-cursor.dylib
+cp dist/auth-cursor.dylib ~/.cli-proxy-api/plugins/darwin/arm64/auth-cursor-v2.0.0.dylib
+chmod +x ~/.cli-proxy-api/plugins/darwin/arm64/auth-cursor*.dylib
+brew services restart cliproxyapi
+```
+
+Confirm in `~/.cli-proxy-api/logs/main.log`:
+
+```
+pluginhost: plugin loaded plugin_id=auth-cursor version=0.0.0-dev
+# or, if the store versioned file is what loaded:
+pluginhost: plugin loaded ... path=.../auth-cursor-v2.0.0.dylib
+```
+
+A `make build` without `-ldflags` reports `0.0.0-dev`. Re-installing from the
+store overwrites the local library with the published release.
+
+Wiping `plugins/` and copying only `auth-cursor.dylib` is not enough if the
+config still records a store install of `auth-cursor` 2.0.0 — the host looks
+for `auth-cursor-v2.0.0.dylib`.
+
+### Bumping the bridge
+
+Replace `proto/`, update `bridgeVersion` and the checksums in
+`go/bridge_release.go`, run `make proto`. Those three move together.
+
+Also re-check `CURSOR_BACKEND_URL` and the default Cursor hosts in
+`go/bridge_egress.go` against strings in the new bridge executable.
+
+## Q&A
+
+**`oauth-excluded-models` looks right. Why is `default` still on `/v1/models`?**
+
+Three separate things have to be true:
+
+1. The block is at host root, provider key `cursor`, not under
+   `plugins.configs.auth-cursor`.
+2. The running library actually filters the catalog (this repo does; store
+   2.0.0 did not).
+3. The host loaded that library. After a store install, copying
+   `auth-cursor.dylib` alone does not replace `auth-cursor-v2.0.0.dylib`.
+
+`default` is a catalog id. Cursor Router is `auto-smart` — exclude that id
+separately if you want Auto gone too.
+
+**I copied `dist/auth-cursor.dylib` and restarted. Nothing changed.**
+
+Check `main.log` for `plugin loaded` and the **path**. If it still names
+`auth-cursor-v2.0.0.dylib`, overwrite that file too (see
+[Installing a local build](#installing-a-local-build)). Confirm
+`plugins.dir` is the directory you copied into (Homebrew:
+`~/.cli-proxy-api/plugins`, not a relative `plugins` next to the binary).
+
+**`/v1/models` has no Cursor entries at all.**
+
+The plugin did not register models. Typical causes: the library never loaded
+(wiped `plugins/` without restoring the versioned filename); discovery failed
+(`cursor model discovery failed` in the log); or registrar timed out
+(`pluginhost: model registrar auth-cursor failed: context deadline exceeded`)
+during shutdown/reload.
+
+**Plugin missing from `/v0/management/plugins`, or `"registered": false`.**
+
+`plugins.enabled` is off, `plugins.dir` does not resolve, or the host binary
+lacks CGO plugin support.
+
+**`create plugin directory: mkdir plugins: read-only file system`**
+
+Relative `plugins.dir` or a literal `~` under brew services / launchd. Set
+`/Users/<you>/.cli-proxy-api/plugins`.
+[CLIProxyAPI #4313](https://github.com/router-for-me/CLIProxyAPI/issues/4313).
+
+**Bridge download / sha256 mismatch / bridge not ready.**
+
+The host cannot reach GitHub, a proxy rewrote the archive, or `bridge-path`
+points at the wrong binary. Download
+`cursor-sdk-bridge-standalone-<platform>.tar.gz` elsewhere and set
+`bridge-path`. The log line `cursor sdk bridge stderr` is the bridge's own
+output.
+
+**`cursor login failed: could not reach the cursor api`**
+
+Host-level `proxy-url` does not apply. Set `plugins.configs.auth-cursor.proxy-url`
+and confirm: `curl -x <proxy> -I --max-time 15 https://api2.cursor.sh`.
+
+**`Model not available … not supported in your region`**
+
+That one model is refused; the credential keeps serving the rest. Hide those
+ids with `oauth-excluded-models.cursor` or per-account `excluded-models`.
+
+**Every Cursor request becomes `503 auth_unavailable` after one failure.**
+
+An unclassified upstream error parked the credential. The `upstream execution
+failed` line names the cause. `disable-cooling: true` is an emergency escape.
+
+**`--cursor-login` has no prompt.**
+
+First run is downloading the bridge. If stdin is not a TTY (brew services,
+redirect), pass `--cursor-api-key`.
+
+**Hundreds of `auth-cursor-sidecar/.../package.json` auth files.**
+
+Plugin 1.0.0 and earlier unpacked a Node sidecar into the default `auth-dir`.
+This version does not. Delete `~/.cli-proxy-api/auth-cursor-sidecar/` by hand.

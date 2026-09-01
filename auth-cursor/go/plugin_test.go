@@ -654,16 +654,16 @@ func TestModelsForAuthReportsTheAccountCatalog(t *testing.T) {
 	if response.Provider != providerIdentifier {
 		t.Errorf("provider = %q, want %q", response.Provider, providerIdentifier)
 	}
-	if len(response.Models) != 2 {
-		t.Fatalf("models = %+v, want the two catalog entries", response.Models)
+	if len(response.Models) != 3 {
+		t.Fatalf("models = %+v, want the three catalog entries", response.Models)
 	}
-	first := response.Models[0]
-	if first.ID != "fake-model" || first.DisplayName != "Fake" {
-		t.Errorf("first model = %+v, want fake-model/Fake", first)
+	fake := modelByID(t, response.Models, "fake-model")
+	if fake.DisplayName != "Fake" {
+		t.Errorf("fake-model display name = %q, want Fake", fake.DisplayName)
 	}
 	// Parameter ids are what the host advertises as supported parameters.
-	if len(first.SupportedParameters) != 1 || first.SupportedParameters[0] != "reasoning_effort" {
-		t.Errorf("supported parameters = %v, want [reasoning_effort]", first.SupportedParameters)
+	if len(fake.SupportedParameters) != 1 || fake.SupportedParameters[0] != "reasoning_effort" {
+		t.Errorf("supported parameters = %v, want [reasoning_effort]", fake.SupportedParameters)
 	}
 }
 
@@ -685,6 +685,155 @@ func TestModelsForAuthReturnsNothingForARejectedKey(t *testing.T) {
 	}
 	if len(response.Models) != 0 {
 		t.Errorf("models = %+v, want none", response.Models)
+	}
+}
+
+func TestApplyExcludedModels(t *testing.T) {
+	models := []pluginapi.ModelInfo{
+		{ID: "default"},
+		{ID: "fake-model"},
+		{ID: "auto-smart"},
+		{ID: "grok-4.5"},
+	}
+	tests := []struct {
+		name     string
+		excluded []string
+		want     []string
+	}{
+		{name: "nothing excluded", want: []string{"default", "fake-model", "auto-smart", "grok-4.5"}},
+		{name: "exact default id", excluded: []string{"default"}, want: []string{"fake-model", "auto-smart", "grok-4.5"}},
+		{name: "quoted default is still default", excluded: []string{" Default "}, want: []string{"fake-model", "auto-smart", "grok-4.5"}},
+		{name: "wildcard suffix", excluded: []string{"grok-*"}, want: []string{"default", "fake-model", "auto-smart"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := applyExcludedModels(models, test.excluded)
+			if len(got) != len(test.want) {
+				t.Fatalf("models = %+v, want %v", got, test.want)
+			}
+			for i, id := range test.want {
+				if got[i].ID != id {
+					t.Errorf("models[%d] = %q, want %q", i, got[i].ID, id)
+				}
+			}
+		})
+	}
+}
+
+func TestModelsForAuthHidesHostExcludedDefault(t *testing.T) {
+	useFakeBridge(t)
+
+	raw, errModels := modelsForAuth(mustJSON(t, pluginapi.AuthModelRequest{
+		AuthID:      "cursor-dev.json",
+		StorageJSON: storageJSON("good-key"),
+		Host: pluginapi.HostConfigSummary{
+			ExcludedModels: map[string][]string{
+				"cursor": {"default"},
+			},
+		},
+	}))
+	if errModels != nil {
+		t.Fatalf("modelsForAuth: %v", errModels)
+	}
+	var response pluginapi.ModelResponse
+	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, raw).Result, &response); errUnmarshal != nil {
+		t.Fatalf("decode models: %v", errUnmarshal)
+	}
+	assertHiddenModel(t, response.Models, "default")
+	modelByID(t, response.Models, "fake-model")
+	modelByID(t, response.Models, "auto-smart")
+}
+
+func TestModelsForAuthHidesPerAccountExcludedModels(t *testing.T) {
+	useFakeBridge(t)
+
+	raw, errModels := modelsForAuth(mustJSON(t, pluginapi.AuthModelRequest{
+		AuthID:      "cursor-dev.json",
+		StorageJSON: []byte(`{"type":"cursor","api_key":"good-key","excluded-models":["default"]}`),
+	}))
+	if errModels != nil {
+		t.Fatalf("modelsForAuth: %v", errModels)
+	}
+	var response pluginapi.ModelResponse
+	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, raw).Result, &response); errUnmarshal != nil {
+		t.Fatalf("decode models: %v", errUnmarshal)
+	}
+	assertHiddenModel(t, response.Models, "default")
+}
+
+func TestModelsForAuthPrefersMergedAttributeExclusions(t *testing.T) {
+	useFakeBridge(t)
+
+	raw, errModels := modelsForAuth(mustJSON(t, pluginapi.AuthModelRequest{
+		AuthID:      "cursor-dev.json",
+		StorageJSON: []byte(`{"type":"cursor","api_key":"good-key","excluded-models":["fake-model"]}`),
+		Host: pluginapi.HostConfigSummary{
+			ExcludedModels: map[string][]string{
+				"cursor": {"auto-smart"},
+			},
+		},
+		Attributes: map[string]string{
+			"excluded_models": "default",
+		},
+	}))
+	if errModels != nil {
+		t.Fatalf("modelsForAuth: %v", errModels)
+	}
+	var response pluginapi.ModelResponse
+	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, raw).Result, &response); errUnmarshal != nil {
+		t.Fatalf("decode models: %v", errUnmarshal)
+	}
+	assertHiddenModel(t, response.Models, "default")
+	modelByID(t, response.Models, "fake-model")
+	modelByID(t, response.Models, "auto-smart")
+}
+
+func TestStaticModelsHidesHostExcludedDefault(t *testing.T) {
+	useFakeBridge(t)
+
+	_, errModels := modelsForAuth(mustJSON(t, pluginapi.AuthModelRequest{
+		AuthID:      "cursor-dev.json",
+		StorageJSON: storageJSON("good-key"),
+	}))
+	if errModels != nil {
+		t.Fatalf("modelsForAuth: %v", errModels)
+	}
+
+	raw, errStatic := staticModels(mustJSON(t, pluginapi.StaticModelRequest{
+		Host: pluginapi.HostConfigSummary{
+			ExcludedModels: map[string][]string{
+				"cursor": {"default"},
+			},
+		},
+	}))
+	if errStatic != nil {
+		t.Fatalf("staticModels: %v", errStatic)
+	}
+	var response pluginapi.ModelResponse
+	if errUnmarshal := json.Unmarshal(decodeEnvelope(t, raw).Result, &response); errUnmarshal != nil {
+		t.Fatalf("decode models: %v", errUnmarshal)
+	}
+	assertHiddenModel(t, response.Models, "default")
+	modelByID(t, response.Models, "fake-model")
+}
+
+func modelByID(t *testing.T, models []pluginapi.ModelInfo, id string) pluginapi.ModelInfo {
+	t.Helper()
+	for _, model := range models {
+		if model.ID == id {
+			return model
+		}
+	}
+	t.Fatalf("missing model %q in %+v", id, models)
+	return pluginapi.ModelInfo{}
+}
+
+func assertHiddenModel(t *testing.T, models []pluginapi.ModelInfo, id string) {
+	t.Helper()
+	for _, model := range models {
+		if model.ID == id {
+			t.Fatalf("model %q still listed: %+v", id, models)
+		}
 	}
 }
 

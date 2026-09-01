@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/tidwall/gjson"
 
 	sdkv1 "github.com/UNICKCHENG/cliproxyapi-plugins/auth-cursor/go/internal/sdk/v1"
 )
@@ -19,12 +20,21 @@ var discoveredCatalog atomic.Value
 // bound to its provider through the executor identifier rather than this list, so an empty
 // response only leaves the provider without registered models until the first per-credential
 // discovery succeeds. Cursor's catalog is never hard-coded here.
-func staticModels() ([]byte, error) {
+func staticModels(raw []byte) ([]byte, error) {
+	var req pluginapi.StaticModelRequest
+	if len(raw) > 0 {
+		if errUnmarshal := json.Unmarshal(raw, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+	}
 	var models []pluginapi.ModelInfo
 	if cached, ok := discoveredCatalog.Load().([]pluginapi.ModelInfo); ok {
 		models = cached
 	}
-	return okEnvelope(pluginapi.ModelResponse{Provider: providerIdentifier, Models: models})
+	return okEnvelope(pluginapi.ModelResponse{
+		Provider: providerIdentifier,
+		Models:   applyExcludedModels(models, excludedModelsForRequest(req.Host, nil, nil)),
+	})
 }
 
 // modelsForAuth discovers the catalog visible to one credential. Which models a key can
@@ -59,7 +69,10 @@ func modelsForAuth(raw []byte) ([]byte, error) {
 			"models":  len(models),
 		})
 	}
-	return okEnvelope(pluginapi.ModelResponse{Provider: providerIdentifier, Models: models})
+	return okEnvelope(pluginapi.ModelResponse{
+		Provider: providerIdentifier,
+		Models:   applyExcludedModels(models, excludedModelsForRequest(req.Host, req.Attributes, req.StorageJSON)),
+	})
 }
 
 // discoverModels asks Cursor which models one credential can reach. Discovery forces a catalog
@@ -111,4 +124,115 @@ func modelInfoFromCatalog(model *sdkv1.SdkModel) (pluginapi.ModelInfo, bool) {
 		SupportedOutputModalities:  []string{"text"},
 		SupportedParameters:        parameters,
 	}, true
+}
+
+// excludedModelsForRequest collects hide-patterns the host already merged into attributes,
+// otherwise the global oauth-excluded-models list plus any per-account excluded-models in
+// the auth file. The catalog is filtered here because /v1/models is this response.
+func excludedModelsForRequest(host pluginapi.HostConfigSummary, attributes map[string]string, storage []byte) []string {
+	if attributes != nil {
+		if combined := strings.TrimSpace(attributes["excluded_models"]); combined != "" {
+			return strings.Split(combined, ",")
+		}
+	}
+	out := append([]string(nil), hostExcludedModels(host)...)
+	return append(out, excludedModelsFromStorage(storage)...)
+}
+
+func hostExcludedModels(host pluginapi.HostConfigSummary) []string {
+	if len(host.ExcludedModels) == 0 {
+		return nil
+	}
+	if models, ok := host.ExcludedModels[providerIdentifier]; ok {
+		return models
+	}
+	for key, models := range host.ExcludedModels {
+		if strings.EqualFold(key, providerIdentifier) {
+			return models
+		}
+	}
+	return nil
+}
+
+func excludedModelsFromStorage(storage []byte) []string {
+	raw := gjson.GetBytes(storage, "excluded_models")
+	if !raw.Exists() {
+		raw = gjson.GetBytes(storage, "excluded-models")
+	}
+	if !raw.Exists() || !raw.IsArray() {
+		return nil
+	}
+	out := make([]string, 0, len(raw.Array()))
+	for _, item := range raw.Array() {
+		if trimmed := strings.TrimSpace(item.String()); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func applyExcludedModels(models []pluginapi.ModelInfo, excluded []string) []pluginapi.ModelInfo {
+	if len(models) == 0 || len(excluded) == 0 {
+		return models
+	}
+	patterns := make([]string, 0, len(excluded))
+	for _, item := range excluded {
+		if trimmed := strings.TrimSpace(item); trimmed != "" {
+			patterns = append(patterns, strings.ToLower(trimmed))
+		}
+	}
+	if len(patterns) == 0 {
+		return models
+	}
+	filtered := make([]pluginapi.ModelInfo, 0, len(models))
+	for _, model := range models {
+		id := strings.ToLower(strings.TrimSpace(model.ID))
+		blocked := false
+		for _, pattern := range patterns {
+			if matchExcludedModel(pattern, id) {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
+}
+
+// matchExcludedModel is the host's oauth-excluded-models matcher: case-insensitive,
+// with '*' matching any substring.
+func matchExcludedModel(pattern, value string) bool {
+	if pattern == "" {
+		return false
+	}
+	if !strings.Contains(pattern, "*") {
+		return pattern == value
+	}
+	parts := strings.Split(pattern, "*")
+	if prefix := parts[0]; prefix != "" {
+		if !strings.HasPrefix(value, prefix) {
+			return false
+		}
+		value = value[len(prefix):]
+	}
+	if suffix := parts[len(parts)-1]; suffix != "" {
+		if !strings.HasSuffix(value, suffix) {
+			return false
+		}
+		value = value[:len(value)-len(suffix)]
+	}
+	for i := 1; i < len(parts)-1; i++ {
+		segment := parts[i]
+		if segment == "" {
+			continue
+		}
+		idx := strings.Index(value, segment)
+		if idx < 0 {
+			return false
+		}
+		value = value[idx+len(segment):]
+	}
+	return true
 }

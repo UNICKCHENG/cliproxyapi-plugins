@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/structpb"
 
@@ -119,6 +120,10 @@ func (f *fakeBridge) ListModels(_ context.Context, req *connect.Request[sdkv1.Li
 		return nil, errKey
 	}
 	return connect.NewResponse(&sdkv1.ListModelsResponse{Items: []*sdkv1.SdkModel{
+		{
+			Id:          "default",
+			DisplayName: "Default",
+		},
 		{
 			Id:          "fake-model",
 			DisplayName: "Fake",
@@ -442,6 +447,7 @@ func resetModelCatalogs() {
 		modelCatalogs.Delete(key)
 		return true
 	})
+	discoveredCatalog.Store([]pluginapi.ModelInfo(nil))
 }
 
 func storageJSON(apiKey string) []byte {
