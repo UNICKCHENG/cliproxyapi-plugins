@@ -1,29 +1,20 @@
 # CLIProxyAPI plugins
 
-Third-party plugins for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI).
-This repository is a plugin store source you add to the host configuration.
+Third-party plugins for [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI). Add this repository as a store source; the host installs plugins from `registry.json`.
 
-## What this is
+Each subdirectory is one plugin and versions on its own.
 
-Each subdirectory is one plugin. The host loads a C-ABI library
-(`.dylib` / `.so` / `.dll`) and talks to it over the plugin RPC. Plugins
-version independently; `registry.json` is the store catalog.
-
-| ID | What it does | Docs |
+| ID | Purpose | Docs |
 | --- | --- | --- |
-| `auth-cursor` | Expose Cursor models through CLIProxyAPI | [auth-cursor/README.md](auth-cursor/README.md) |
-
-Plugin IDs (`auth-cursor`) are not provider keys (`cursor`). Credentials,
-`owned_by` on `/v1/models`, and host blocks such as `oauth-excluded-models`
-use the provider key. Details live in the plugin README.
+| `auth-cursor` | Call Cursor models through CLIProxyAPI | [auth-cursor/README.md](auth-cursor/README.md) |
 
 ## Use
 
-1. CLIProxyAPI built with CGO (`X-CPA-SUPPORT-PLUGIN: 1` on management responses).
-2. A management key (`remote-management.secret-key`).
-3. Add this store and enable plugins. Under Homebrew / launchd / systemd,
-   `plugins.dir` must be an **absolute writable path** — a relative `"plugins"`
-   or `~` is resolved against `/`.
+The host needs:
+
+- A CLIProxyAPI binary built with CGO (`X-CPA-SUPPORT-PLUGIN: 1` on management responses)
+- A management key (`remote-management.secret-key`)
+- An **absolute writable** `plugins.dir`. Under Homebrew / launchd / systemd, a relative `"plugins"` or `~` is resolved against `/`
 
 ```yaml
 plugins:
@@ -33,17 +24,18 @@ plugins:
     - "https://raw.githubusercontent.com/UNICKCHENG/cliproxyapi-plugins/main/registry.json"
 ```
 
-4. Restart the host, then install from the store:
+Restart CLIProxyAPI, then install:
 
 ```bash
 curl -X POST -H "Authorization: Bearer $MANAGEMENT_KEY" \
   "localhost:8317/v0/management/plugin-store/auth-cursor/install"
 ```
 
-Credentials, models, proxying, and troubleshooting:
-[auth-cursor/README.md](auth-cursor/README.md).
+Store install does not flip `plugins.enabled`; set that yourself. Credentials, models, and plugin options live in the plugin README.
 
-## Local development
+## Develop
+
+Each plugin has its own `Makefile` and README.
 
 ```bash
 cd auth-cursor
@@ -51,14 +43,15 @@ make test
 make build          # dist/auth-cursor.<ext>
 ```
 
-Copy the library into `plugins/<GOOS>/<GOARCH>/` and restart the host.
-If the plugin was previously installed from the store, the host loads a
-**versioned** filename (`auth-cursor-v2.0.0.dylib`). Copying only
-`auth-cursor.dylib` is not enough — see
-[auth-cursor/README.md — Development](auth-cursor/README.md#development).
+How to load a local build, bump dependencies, and cut a release: see the plugin README.
 
-Releases: tag `<plugin>-v<version>` (for example `auth-cursor-v2.0.0`).
-The workflow publishes platform archives and updates `registry.json`.
+Release tags are `<plugin>-v<version>` (for example `auth-cursor-v2.0.0`). CI publishes platform archives and updates `registry.json`.
+
+## If install fails
+
+- `create plugin directory: mkdir plugins: read-only file system`: set `plugins.dir` to an absolute path.
+- No `X-CPA-SUPPORT-PLUGIN` on management responses: this binary does not support dynamic plugins.
+- The plugin installed but behaves wrong: the plugin README's troubleshooting section.
 
 ## License
 
