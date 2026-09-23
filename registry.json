@@ -2,6 +2,59 @@
   "schema_version": 2,
   "plugins": [
     {
+      "id": "auth-commandcode",
+      "name": "Command Code Provider",
+      "description": "Call Command Code models through the official Provider API.",
+      "author": "UNICKCHENG",
+      "version": "0.1.0",
+      "repository": "https://github.com/UNICKCHENG/cliproxyapi-plugins",
+      "homepage": "https://github.com/UNICKCHENG/cliproxyapi-plugins/tree/main/auth-commandcode",
+      "license": "MIT",
+      "tags": [
+        "provider"
+      ],
+      "install": {
+        "type": "direct",
+        "artifacts": [
+          {
+            "goos": "darwin",
+            "goarch": "amd64",
+            "url": "https://github.com/UNICKCHENG/cliproxyapi-plugins/releases/download/auth-commandcode-v0.1.0/auth-commandcode_0.1.0_darwin_amd64.zip",
+            "sha256": "adc0c2a8bd3a79d07d239fcb4ce5524e2f728aceb0973892ac60e63cf078e310",
+            "size": 3073957
+          },
+          {
+            "goos": "darwin",
+            "goarch": "arm64",
+            "url": "https://github.com/UNICKCHENG/cliproxyapi-plugins/releases/download/auth-commandcode-v0.1.0/auth-commandcode_0.1.0_darwin_arm64.zip",
+            "sha256": "bd4e517f2eae3155e858e79da59602c4dcad61e29e713cecc05d7d26e6dc7991",
+            "size": 2825500
+          },
+          {
+            "goos": "linux",
+            "goarch": "amd64",
+            "url": "https://github.com/UNICKCHENG/cliproxyapi-plugins/releases/download/auth-commandcode-v0.1.0/auth-commandcode_0.1.0_linux_amd64.zip",
+            "sha256": "409ac136d34bb12066e8dc2cce366a7af05a6f2a7d0615d1767b1bd5d48dff52",
+            "size": 5634651
+          },
+          {
+            "goos": "linux",
+            "goarch": "arm64",
+            "url": "https://github.com/UNICKCHENG/cliproxyapi-plugins/releases/download/auth-commandcode-v0.1.0/auth-commandcode_0.1.0_linux_arm64.zip",
+            "sha256": "5d71407e00cc23b1215e40e71787503c57444f3bb3d901f032a6311011433764",
+            "size": 5108351
+          },
+          {
+            "goos": "windows",
+            "goarch": "amd64",
+            "url": "https://github.com/UNICKCHENG/cliproxyapi-plugins/releases/download/auth-commandcode-v0.1.0/auth-commandcode_0.1.0_windows_amd64.zip",
+            "sha256": "270a238f4346586bf911a13a8edb47b286cec82c14b9857c9952922a3b8fa819",
+            "size": 5568294
+          }
+        ]
+      }
+    },
+    {
       "id": "auth-cursor",
       "name": "Cursor Provider",
       "description": "Call Cursor models through the official Cursor SDK Bridge.",
