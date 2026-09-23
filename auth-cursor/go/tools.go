@@ -40,6 +40,11 @@ type toolCallbackServer struct{}
 
 type toolRun struct {
 	mu sync.Mutex
+	// deltaMu is held while readStream invokes the waiter's onDelta, and taken once by
+	// waitOn before it returns a turn. It orders delta delivery against turn completion so
+	// the caller never reads what onDelta wrote (or emits the finished response) while the
+	// stream goroutine is still inside the callback, and no delta lands after the turn.
+	deltaMu sync.Mutex
 
 	process     *bridgeProcess
 	fingerprint string
@@ -256,6 +261,17 @@ func (r *toolRun) detachWaiter(waiter *turnWaiter) {
 }
 
 func (r *toolRun) waitOn(ctx context.Context, waiter *turnWaiter) (generateResult, error) {
+	result, err := r.await(ctx, waiter)
+	// Wait out any delta still being delivered on this turn. The turn can complete on the
+	// batch timer or an abort while readStream is inside onDelta, and the caller is about to
+	// start using what onDelta wrote (the response writer, a test's collected deltas), so
+	// this is the happens-before edge that makes the hand-off safe.
+	r.deltaMu.Lock()
+	r.deltaMu.Unlock()
+	return result, err
+}
+
+func (r *toolRun) await(ctx context.Context, waiter *turnWaiter) (generateResult, error) {
 	select {
 	case out := <-waiter.done:
 		return out.result, out.err
@@ -436,17 +452,24 @@ func (r *toolRun) readStream() {
 			if delta == "" {
 				continue
 			}
+			r.deltaMu.Lock()
 			r.mu.Lock()
-			r.text.WriteString(delta)
-			var onDelta func(string) error
-			if r.waiter != nil {
-				onDelta = r.waiter.onDelta
-			}
-			r.mu.Unlock()
-			if onDelta == nil {
+			waiter := r.waiter
+			if waiter == nil {
+				r.mu.Unlock()
+				r.deltaMu.Unlock()
 				continue
 			}
-			if errDelta := onDelta(delta); errDelta != nil {
+			r.text.WriteString(delta)
+			r.mu.Unlock()
+			onDelta := waiter.onDelta
+			if onDelta == nil {
+				r.deltaMu.Unlock()
+				continue
+			}
+			errDelta := onDelta(delta)
+			r.deltaMu.Unlock()
+			if errDelta != nil {
 				r.abort(errDelta)
 				return
 			}
