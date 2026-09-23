@@ -1,0 +1,59 @@
+# Example CLIProxyAPI configuration for the auth-commandcode plugin.
+# Merge the `plugins` block into your own config.yaml.
+
+host: "127.0.0.1"
+port: 8317
+auth-dir: "~/.cli-proxy-api"
+api-keys:
+  - "your-inbound-api-key"
+
+routing:
+  strategy: "weighted-round-robin"
+
+plugins:
+  enabled: true
+  # Relative "plugins" and "~" fail under brew services / launchd (CWD is often
+  # "/", which is read-only). Use an absolute writable path instead:
+  # dir: "/Users/<you>/.cli-proxy-api/plugins"
+  dir: "plugins"
+  store-sources:
+    - "https://raw.githubusercontent.com/UNICKCHENG/cliproxyapi-plugins/main/registry.json"
+  configs:
+    auth-commandcode:
+      enabled: true
+      # Command Code API origin. Provider paths are appended:
+      # /provider/v1/models, /provider/v1/chat/completions, /provider/v1/messages.
+      api-base: "https://api.commandcode.ai"
+      # Proxy for credentials whose auth file sets no proxy_url. Empty uses host.http,
+      # which honours the host-level proxy-url.
+      proxy-url: ""
+      # Send x-cmd-zdr: 1 unless the client already set that header.
+      zdr: false
+      # Per-credential weighted-round-robin share. Keys are matched case-insensitively
+      # against the auth file name with and without ".json", then label.
+      # Omitted credentials use the host default of 1; 0 parks the credential.
+      weights: {}
+      # weights:
+      #   commandcode-ab12cd34ef56.json: 5
+
+# Model aliases and exclusions for Command Code credentials. The provider key is
+# `commandcode`, not the plugin id, and both blocks are host-level.
+# oauth-model-alias:
+#   commandcode:
+#     - name: "deepseek/deepseek-v4-flash"
+#       alias: "deepseek-flash"
+#
+# oauth-excluded-models:
+#   commandcode:
+#     - "claude-*"
+
+# Credentials live in auth-dir, one JSON file per Command Code API key. Create the
+# key in Studio, then either run `cli-proxy-api --commandcode-login` and paste it,
+# or write the file yourself. Note that "type" is the provider key `commandcode`,
+# not the plugin id `auth-commandcode`:
+#
+#   $(auth-dir)/commandcode-*.json
+#   {"type": "commandcode", "api_key": "user_..."}
+#
+# Optional fields: label, prefix, proxy_url, disabled, note, and the per-account
+# model_aliases / excluded-models lists.

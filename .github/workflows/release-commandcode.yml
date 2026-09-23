@@ -1,0 +1,161 @@
+name: Release auth-commandcode plugin
+
+# Each plugin releases on its own tag so that a release never disturbs the other plugins
+# in this repository. The registry pins artifact URLs per version, so the tag name only
+# has to be unique; the installed version comes from registry.json.
+on:
+  push:
+    tags:
+      - "auth-commandcode-v*"
+
+permissions:
+  contents: write
+
+env:
+  PLUGIN_ID: auth-commandcode
+
+jobs:
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            goos: darwin
+            goarch: arm64
+            extension: dylib
+          # macos-13 was retired in Dec 2025. macos-15-intel is the hosted x86_64 replacement.
+          - runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+            extension: dylib
+          - runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+            extension: so
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            extension: so
+          - runner: windows-2022
+            goos: windows
+            goarch: amd64
+            extension: dll
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: auth-commandcode/go/go.mod
+          cache-dependency-path: auth-commandcode/go/go.sum
+
+      - name: Resolve version from tag
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#${PLUGIN_ID}-v}" >> "$GITHUB_OUTPUT"
+
+      # go build is invoked directly rather than through the Makefile because the Windows
+      # runner has no GNU make. A c-shared build needs a native toolchain, which is why the
+      # matrix uses one runner per target instead of cross-compiling.
+      - name: Build shared library
+        shell: bash
+        working-directory: auth-commandcode/go
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p ../dist
+          go build -buildmode=c-shared \
+            -ldflags "-X main.pluginVersion=${{ steps.version.outputs.version }}" \
+            -o "../dist/${PLUGIN_ID}.${{ matrix.extension }}" .
+          rm -f "../dist/${PLUGIN_ID}.h"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PLUGIN_ID }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: auth-commandcode/dist/${{ env.PLUGIN_ID }}.${{ matrix.extension }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish release and registry
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: libraries
+
+      - name: Resolve version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#${PLUGIN_ID}-v}" >> "$GITHUB_OUTPUT"
+
+      # The host extracts only the dynamic library and requires it at the archive root,
+      # so every archive is built here from a single flat staging directory.
+      - name: Package archives
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          release_dir="$PWD/release"
+          mkdir -p "$release_dir"
+          for directory in libraries/"$PLUGIN_ID"-*; do
+            platform="${directory#libraries/$PLUGIN_ID-}"
+            goos="${platform%%-*}"
+            goarch="${platform#*-}"
+            library=$(find "$directory" -maxdepth 1 -type f -name "$PLUGIN_ID.*" -print -quit)
+            if [ -z "$library" ]; then
+              echo "no library in $directory" >&2
+              exit 1
+            fi
+            staging=$(mktemp -d)
+            cp "$library" "$staging/"
+            (cd "$staging" && zip -q -X "$release_dir/${PLUGIN_ID}_${VERSION}_${goos}_${goarch}.zip" "$(basename "$library")")
+            rm -rf "$staging"
+          done
+          cd "$release_dir"
+          sha256sum *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Update registry
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          node scripts/update-registry.mjs \
+            --plugin "$PLUGIN_ID" \
+            --version "$VERSION" \
+            --tag "$GITHUB_REF_NAME" \
+            --assets release \
+            --repository "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+          node scripts/validate-registry.mjs
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$PLUGIN_ID ${{ steps.version.outputs.version }}" \
+            --generate-notes \
+            release/*.zip release/checksums.txt
+
+      # The registry must reference an existing release, so it is committed only after the
+      # release exists. Clients read registry.json from the default branch.
+      - name: Commit registry
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- registry.json; then
+            echo "registry.json unchanged"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add registry.json
+          git commit -m "chore(registry): $PLUGIN_ID ${{ steps.version.outputs.version }}"
+          git push origin HEAD:main

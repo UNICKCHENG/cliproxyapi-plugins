@@ -7,6 +7,7 @@ Each subdirectory is one plugin and versions on its own.
 | ID | Purpose | Docs |
 | --- | --- | --- |
 | `auth-cursor` | Call Cursor models through CLIProxyAPI | [auth-cursor/README.md](auth-cursor/README.md) |
+| `auth-commandcode` | Call Command Code models through CLIProxyAPI | [auth-commandcode/README.md](auth-commandcode/README.md) |
 
 ## Use
 
@@ -41,6 +42,14 @@ Each plugin has its own `Makefile` and README.
 cd auth-cursor
 make test
 make build          # dist/auth-cursor.<ext>
+```
+
+The Command Code plugin is the same shape:
+
+```bash
+cd auth-commandcode
+make test
+make build          # dist/auth-commandcode.<ext>
 ```
 
 How to load a local build, bump dependencies, and cut a release: see the plugin README.

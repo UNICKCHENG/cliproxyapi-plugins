@@ -1,0 +1,10 @@
+{
+  "id": "auth-commandcode",
+  "name": "Command Code Provider",
+  "description": "Call Command Code models through the official Provider API.",
+  "author": "UNICKCHENG",
+  "license": "MIT",
+  "tags": [
+    "provider"
+  ]
+}
