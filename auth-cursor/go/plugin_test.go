@@ -636,6 +636,104 @@ func TestResolveModelSelectionFiltersAndBackfillsParameters(t *testing.T) {
 	}
 }
 
+// Cursor names the reasoning knob per model, so a client's reasoning_effort has to reach effort and
+// reasoning too, and fast/thinking come from service_tier and a "none" effort.
+func TestResolveModelSelectionTranslatesReasoningAndFastParameters(t *testing.T) {
+	values := func(vs ...string) []*sdkv1.ModelParameterDefinitionValue {
+		out := make([]*sdkv1.ModelParameterDefinitionValue, 0, len(vs))
+		for _, v := range vs {
+			out = append(out, &sdkv1.ModelParameterDefinitionValue{Value: v})
+		}
+		return out
+	}
+	catalog := []*sdkv1.SdkModel{
+		{
+			Id: "effort-model",
+			Parameters: []*sdkv1.ModelParameterDefinition{
+				{Id: "effort", Values: values("low", "medium", "high", "xhigh", "max")},
+				{Id: fastParameter, Values: values("false", "true")},
+			},
+		},
+		{
+			Id:         "reasoning-model",
+			Parameters: []*sdkv1.ModelParameterDefinition{{Id: "reasoning", Values: values("low", "high", "max")}},
+		},
+		{
+			Id: "thinking-model",
+			Parameters: []*sdkv1.ModelParameterDefinition{
+				{Id: thinkingParameter, Values: values("false", "true")},
+				{Id: "effort", Values: values("low", "high")},
+			},
+		},
+	}
+	effort := func(v string) modelParam { return modelParam{ID: reasoningEffortParameter, Value: v} }
+
+	for _, test := range []struct {
+		name       string
+		model      string
+		requested  []modelParam
+		wantParams map[string]string
+	}{
+		{
+			name:       "reasoning_effort fills effort",
+			model:      "effort-model",
+			requested:  []modelParam{effort("xhigh")},
+			wantParams: map[string]string{"effort": "xhigh"},
+		},
+		{
+			name:       "reasoning_effort fills reasoning",
+			model:      "reasoning-model",
+			requested:  []modelParam{effort("max")},
+			wantParams: map[string]string{"reasoning": "max"},
+		},
+		{
+			name:       "an effort the model does not list is dropped",
+			model:      "reasoning-model",
+			requested:  []modelParam{effort("medium")},
+			wantParams: map[string]string{},
+		},
+		{
+			name:       "fast is forwarded alongside effort",
+			model:      "effort-model",
+			requested:  []modelParam{effort("high"), {ID: fastParameter, Value: "true"}},
+			wantParams: map[string]string{"effort": "high", fastParameter: "true"},
+		},
+		{
+			name:       "an effort turns thinking on",
+			model:      "thinking-model",
+			requested:  []modelParam{effort("low")},
+			wantParams: map[string]string{thinkingParameter: "true", "effort": "low"},
+		},
+		{
+			name:       "none turns thinking off",
+			model:      "thinking-model",
+			requested:  []modelParam{effort("none")},
+			wantParams: map[string]string{thinkingParameter: "false"},
+		},
+		{
+			name:       "fast is dropped where the model has no fast mode",
+			model:      "reasoning-model",
+			requested:  []modelParam{{ID: fastParameter, Value: "true"}},
+			wantParams: map[string]string{},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := map[string]string{}
+			for _, param := range resolveModelSelection(catalog, test.model, test.requested, "").GetParams() {
+				got[param.GetId()] = param.GetValue()
+			}
+			if len(got) != len(test.wantParams) {
+				t.Fatalf("params = %v, want %v", got, test.wantParams)
+			}
+			for id, want := range test.wantParams {
+				if got[id] != want {
+					t.Errorf("params[%s] = %q, want %q", id, got[id], want)
+				}
+			}
+		})
+	}
+}
+
 // An empty catalog is what a failed ListModels leaves behind, and it must not stop a run.
 func TestResolveModelSelectionWithoutACatalog(t *testing.T) {
 	selection := resolveModelSelection(nil, "fake-model", []modelParam{{ID: "reasoning_effort", Value: "high"}}, "balanced")

@@ -340,7 +340,22 @@ func chatParams(payload []byte) []modelParam {
 	}
 	add("reasoning_effort", gjson.GetBytes(payload, "reasoning_effort").String())
 	add("reasoning_effort", gjson.GetBytes(payload, "reasoning.effort").String())
+	if param, ok := serviceTierParam(payload); ok {
+		add(param.ID, param.Value)
+	}
 	return params
+}
+
+// fastParameter selects a model's fast mode where the catalog offers one.
+const fastParameter = "fast"
+
+// serviceTierParam maps OpenAI's service_tier onto Cursor's fast mode: "priority" is the tier
+// clients use to ask for faster serving.
+func serviceTierParam(payload []byte) (modelParam, bool) {
+	if !strings.EqualFold(strings.TrimSpace(gjson.GetBytes(payload, "service_tier").String()), "priority") {
+		return modelParam{}, false
+	}
+	return modelParam{ID: fastParameter, Value: "true"}, true
 }
 
 func newCompletionID() string {

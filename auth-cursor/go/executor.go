@@ -255,6 +255,13 @@ func buildGenerateRequest(req pluginapi.ExecutorRequest) (generateRequest, strin
 	if errParse != nil {
 		return generateRequest{}, "", errParse
 	}
+	// The host's Responses-to-chat translation drops service_tier, so the client's own body is
+	// the only place a /v1/responses caller's fast-mode request survives.
+	if _, ok := suppliedParameter(chat.Params, fastParameter); !ok {
+		if param, ok := serviceTierParam(req.OriginalRequest); ok {
+			chat.Params = append(chat.Params, param)
+		}
+	}
 	return generateRequest{
 		apiKey:           apiKey,
 		proxyURL:         resolveProxyURL(req.StorageJSON),

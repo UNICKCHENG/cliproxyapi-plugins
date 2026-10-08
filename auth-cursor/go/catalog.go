@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +17,17 @@ import (
 // optimizeForParameter is the model parameter the Cursor Router reads. The router model rejects a
 // request that omits it, so it is the one parameter the plugin backfills.
 const optimizeForParameter = "optimize_for"
+
+// reasoningEffortParameter is the id chatParams gives the client's reasoning effort. Cursor names
+// that knob differently per model (reasoning_effort, effort, reasoning), so the requested value is
+// offered to whichever of those ids the selected model exposes.
+const reasoningEffortParameter = "reasoning_effort"
+
+var reasoningEffortAliases = map[string]bool{"effort": true, "reasoning": true}
+
+// thinkingParameter switches extended thinking on models that expose it. A reasoning effort of
+// "none" turns it off; any other effort turns it on.
+const thinkingParameter = "thinking"
 
 // catalogTTL bounds how long a credential's model catalog is reused. Which models a key can
 // reach follows the account plan and team policy, both of which change outside this process.
@@ -96,7 +108,7 @@ func resolveModelSelection(models []*sdkv1.SdkModel, modelID string, requested [
 	params := make([]*sdkv1.ModelParameterValue, 0, len(entry.GetParameters()))
 	for _, definition := range entry.GetParameters() {
 		allowed := allowedParameterValues(definition)
-		if supplied, ok := suppliedParameter(requested, definition.GetId()); ok && allowed[supplied] {
+		if supplied, ok := requestedValue(requested, definition.GetId()); ok && allowed[supplied] {
 			params = append(params, &sdkv1.ModelParameterValue{Id: definition.GetId(), Value: supplied})
 			continue
 		}
@@ -125,6 +137,26 @@ func findCatalogModel(models []*sdkv1.SdkModel, modelID string) *sdkv1.SdkModel 
 		}
 	}
 	return nil
+}
+
+// requestedValue returns the client's value for one catalog parameter, translating the generic
+// reasoning effort onto the id this model uses for it.
+func requestedValue(requested []modelParam, id string) (string, bool) {
+	if supplied, ok := suppliedParameter(requested, id); ok {
+		return supplied, true
+	}
+	effort, ok := suppliedParameter(requested, reasoningEffortParameter)
+	if !ok {
+		return "", false
+	}
+	switch {
+	case reasoningEffortAliases[id]:
+		return effort, true
+	case id == thinkingParameter:
+		return strconv.FormatBool(!strings.EqualFold(effort, "none")), true
+	default:
+		return "", false
+	}
 }
 
 func allowedParameterValues(definition *sdkv1.ModelParameterDefinition) map[string]bool {

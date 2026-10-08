@@ -153,7 +153,7 @@ The egress binds `[::1]`, then `127.0.0.2` if that is missing. It will not bind 
 
 Availability is per account. The plugin asks Cursor for the catalog with each credential. Whatever that key can reach shows up on `/v1/models`: Composer, Grok, and the OpenAI / Anthropic / Google models in the Cursor usage pool. Cursor Router appears as `auto-smart` when the team has it enabled. Some catalogs also include a legacy `default` id.
 
-`optimize-for` is applied to `auto-smart`. Other per-model parameters are dropped when the selected model does not expose them. Matching is by id only. A failed discovery publishes nothing for that key; generation still forwards the requested id and Cursor decides.
+`optimize-for` is applied to `auto-smart`. Other per-model parameters are dropped when the selected model does not expose them. Matching is by id only, with two translations: `reasoning_effort` / `reasoning.effort` also fills a model's `effort` or `reasoning` parameter (Cursor names it per model), and `none` sets `thinking` to `false` where offered; `service_tier: "priority"` sets `fast` to `true`. A value the model does not list is dropped. A failed discovery publishes nothing for that key; generation still forwards the requested id and Cursor decides.
 
 Aliases and exclusions are host-level, keyed by `cursor`:
 
