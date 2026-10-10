@@ -26,6 +26,40 @@ func TestChatParamsKeepsTheFirstReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestChatParamsMapsPriorityServiceTierToFast(t *testing.T) {
+	for _, test := range []struct {
+		payload  string
+		wantFast bool
+	}{
+		{payload: `{"service_tier":"priority"}`, wantFast: true},
+		{payload: `{"service_tier":"default"}`},
+		{payload: `{}`},
+	} {
+		_, gotFast := suppliedParameter(chatParams([]byte(test.payload)), fastParameter)
+		if gotFast != test.wantFast {
+			t.Errorf("%s: fast present = %v, want %v", test.payload, gotFast, test.wantFast)
+		}
+	}
+}
+
+// A /v1/responses caller's service_tier is lost in the host's translation to chat completions, so
+// the plugin reads it from the original request body.
+func TestBuildGenerateRequestReadsServiceTierFromTheOriginalRequest(t *testing.T) {
+	req := mustExecutorRequest(t, "good-key", map[string]any{
+		"model":    "fake-model",
+		"messages": []map[string]any{{"role": "user", "content": "hi"}},
+	})
+	req.OriginalRequest = []byte(`{"model":"fake-model","input":"hi","service_tier":"priority"}`)
+
+	generateReq, _, errBuild := buildGenerateRequest(req)
+	if errBuild != nil {
+		t.Fatalf("buildGenerateRequest: %v", errBuild)
+	}
+	if value, ok := suppliedParameter(generateReq.params, fastParameter); !ok || value != "true" {
+		t.Fatalf("params = %+v, want fast=true", generateReq.params)
+	}
+}
+
 func TestCheckPromptBudgetRejectsAnOversizedPrompt(t *testing.T) {
 	previous := promptMaxRunes
 	promptMaxRunes = 8
