@@ -178,6 +178,17 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return okEnvelope(struct{}{})
 	case pluginabi.MethodAuthIdentifier, pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(map[string]string{"identifier": providerIdentifier})
+	case "quota.identifier":
+		return okEnvelope(map[string]string{"identifier": providerIdentifier})
+	case "quota.describe":
+		return okEnvelope(struct {
+			SupportedProviders []string `json:"supported_providers"`
+			SupportsReset      bool     `json:"supports_reset"`
+		}{SupportedProviders: []string{providerIdentifier}})
+	case "quota.fetch":
+		return fetchCursorQuota(request)
+	case "quota.reset":
+		return errorEnvelope("unsupported", "cursor quota reset is not supported"), nil
 	case pluginabi.MethodAuthParse:
 		return parseAuth(request)
 	case pluginabi.MethodAuthRefresh:

@@ -65,6 +65,7 @@ type registration struct {
 
 type registrationCapability struct {
 	AuthProvider          bool     `json:"auth_provider"`
+	QuotaProvider         bool     `json:"quota_provider"`
 	ModelProvider         bool     `json:"model_provider"`
 	CommandLinePlugin     bool     `json:"command_line_plugin"`
 	Executor              bool     `json:"executor"`
@@ -194,6 +195,7 @@ func pluginRegistration() registration {
 		},
 		Capabilities: registrationCapability{
 			AuthProvider:          true,
+			QuotaProvider:         true,
 			ModelProvider:         true,
 			CommandLinePlugin:     true,
 			Executor:              true,

@@ -21,6 +21,14 @@ client (OpenAI / Claude / Gemini)
 
 A full host config is in [config.example.yaml](config.example.yaml).
 
+## Quota display
+
+The quota provider returns separate Auto and API included-usage groups for an indexed Cursor credential. The host must supply the selected credential's current `storage_json`. The reader exchanges that API key once, then reads identity, current-period usage, and hard limits with one token and the default team selection. It uses Connect unary JSON directly, without starting the SDK bridge. Reset is unsupported.
+
+Both percentages and the current billing period must validate, and every required read must succeed. Any failure returns a sanitized error without quota numbers. The reader uses the existing credential, plugin, and environment proxy order. In direct mode it refuses backend overrides other than `https://api2.cursor.sh`.
+
+These groups are display values. They do not establish Composer model membership, billing scope, no-spend controls, or permission to send inference. The reader does not publish spend policy, currency, model lists, or capacity. Upstream JSON support and selected-key permissions require separate live verification.
+
 ## Use
 
 Store source and `plugins.dir` are in the [repository README](../README.md). This section is what this plugin adds on top.
