@@ -27,6 +27,11 @@ const toolResultMissing = "tool result was not delivered"
 
 var errToolResultTimeout = errors.New(toolResultMissing)
 
+// errToolTurnRewritten aborts a parked run whose tool turn the client rewrote: the results
+// answer every announced call but also carry ids this plugin never issued, so they cannot be
+// mapped back onto the live Send stream.
+var errToolTurnRewritten = errors.New("tool turn rewritten by the client")
+
 var toolRegistry = struct {
 	mu              sync.Mutex
 	byAgentID       map[string]*toolRun
@@ -212,13 +217,39 @@ func lookupResumeRun(req generateRequest) (*toolRun, bool, error) {
 	if hits == 0 {
 		return nil, false, nil
 	}
-	if hits != len(ids) {
-		return nil, true, toolRequestError("partial tool result resume")
-	}
 	if run.fingerprint != fingerprint {
 		return nil, true, toolRequestError("tool results do not match this credential")
 	}
+	if hits != len(ids) {
+		if !run.answersEveryAnnouncedCall(seen) {
+			return nil, true, toolRequestError("partial tool result resume")
+		}
+		// Every announced call is answered, plus ids this plugin never issued: the client
+		// rewrote the assistant turn (for example, split one batch call into several calls
+		// with ids of its own). Those results cannot be delivered to the parked Send stream,
+		// and the client will keep replaying the same history, so resuming can never succeed.
+		// Release the parked agent and let the caller rebuild the run from the transcript,
+		// as it already does for results whose ids are all unknown.
+		run.abort(errToolTurnRewritten)
+		return nil, false, nil
+	}
 	return run, true, nil
+}
+
+// answersEveryAnnouncedCall reports whether ids covers every call of the turn currently
+// announced to the client.
+func (r *toolRun) answersEveryAnnouncedCall(ids map[string]struct{}) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.finished || len(r.announced) == 0 {
+		return false
+	}
+	for _, rec := range r.announced {
+		if _, ok := ids[rec.exposedID]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func registerToolRun(run *toolRun) {

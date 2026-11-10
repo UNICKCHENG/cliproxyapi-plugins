@@ -180,7 +180,7 @@ This is an agent SDK, not a raw inference API. Claude or GPT selections still ru
 
 A text-only conversation that continues from the last assistant turn is sent as an increment on the same `agent_id` when the credential, model, and tool set match. A miss, a concurrent request with the same key, or a failed/cancelled turn starts a new agent. If reuse cannot be proven, the plugin flattens the full message list into one user prompt — larger than the same dialogue on a native API. An over-budget send returns **400** `context_length_exceeded` without cooling the credential.
 
-Tools stay off unless the client sends them. The working directory is always empty. Client `tools` are registered as `local.custom_tools` and need an mcp allowlist. Dropping the stream does not stop Cursor; the plugin issues an explicit cancel, then deletes the agent.
+Tools stay off unless the client sends them. The working directory is always empty. Client `tools` are registered as `local.custom_tools` and need an mcp allowlist. Dropping the stream does not stop Cursor; the plugin issues an explicit cancel, then deletes the agent. Tool results must answer exactly the calls of the last tool turn. Results that answer every announced call plus ids the plugin never issued (a client that split one call into several) release the parked agent and start a new one from the transcript; missing, duplicate or mixed results return 400.
 
 Other limits:
 
