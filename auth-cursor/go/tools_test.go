@@ -490,6 +490,91 @@ func TestUnknownToolCallIDStartsNewAgentWithTranscript(t *testing.T) {
 	}
 }
 
+func TestPartialResumeWithUnansweredCallKeepsParkedRun(t *testing.T) {
+	bridge := useFakeBridge(t)
+	bridge.toolRounds = []fakeToolRound{{
+		Calls: []fakeToolCall{
+			{Name: "get_weather", Args: map[string]any{"city": "Paris"}},
+			{Name: "get_weather", Args: map[string]any{"city": "Rome"}},
+		},
+	}}
+	first, errFirst := runGenerate(context.Background(), toolGenerateRequest(t, "good-key", "hi"), nil)
+	if errFirst != nil {
+		t.Fatalf("park: %v", errFirst)
+	}
+	if len(first.toolCalls) != 2 {
+		t.Fatalf("announced calls = %d, want 2", len(first.toolCalls))
+	}
+
+	// One announced call is answered, the other is not: still a client error.
+	_, errResume := runGenerate(context.Background(), generateRequest{
+		apiKey:      "good-key",
+		model:       "fake-model",
+		optimizeFor: defaultOptimizeFor,
+		toolResults: []chatToolResult{
+			{CallID: first.toolCalls[0].ID, Content: "22C"},
+			{CallID: "call_missing", Content: "y"},
+		},
+	}, nil)
+	if errResume == nil || failureFrom(errResume).HTTPStatus != 400 {
+		t.Fatalf("err = %v, want a 400 partial resume", errResume)
+	}
+	toolRegistry.mu.Lock()
+	run := toolRegistry.byAgentID["agent-1"]
+	toolRegistry.mu.Unlock()
+	if run == nil {
+		t.Fatal("parked run should survive an unanswered call")
+	}
+	if len(bridge.createdAgents()) != 1 {
+		t.Fatalf("created = %d, want 1", len(bridge.createdAgents()))
+	}
+}
+
+func TestRewrittenToolTurnStartsNewAgentWithTranscript(t *testing.T) {
+	bridge := useFakeBridge(t)
+	bridge.toolRounds = []fakeToolRound{{
+		Calls: []fakeToolCall{{Name: "get_weather", Args: map[string]any{"city": "Paris"}}},
+	}}
+	first, errFirst := runGenerate(context.Background(), toolGenerateRequest(t, "good-key", "hi"), nil)
+	if errFirst != nil {
+		t.Fatalf("park: %v", errFirst)
+	}
+	id := first.toolCalls[0].ID
+
+	// The client split the announced call into two calls and minted an id for the second,
+	// then answered both. Every announced call is answered, plus one unknown id.
+	_, errExecute := execute(executorRequest(t, "good-key", map[string]any{
+		"messages": []map[string]any{
+			{"role": "user", "content": "weather?"},
+			{"role": "assistant", "content": "", "tool_calls": []map[string]any{
+				{"id": id, "type": "function", "function": map[string]any{"name": "get_weather", "arguments": `{"city":"Paris"}`}},
+				{"id": "call_client_minted", "type": "function", "function": map[string]any{"name": "get_weather", "arguments": `{"city":"Rome"}`}},
+			}},
+			{"role": "tool", "tool_call_id": id, "content": "22C"},
+			{"role": "tool", "tool_call_id": "call_client_minted", "content": "18C"},
+		},
+	}))
+	if errExecute != nil {
+		t.Fatalf("execute: %v", errExecute)
+	}
+
+	toolRegistry.mu.Lock()
+	parked := toolRegistry.byAgentID["agent-1"]
+	_, stillIndexed := toolRegistry.byExposedCallID[id]
+	toolRegistry.mu.Unlock()
+	if parked != nil || stillIndexed {
+		t.Fatal("rewritten turn should release the parked run")
+	}
+	prompts := bridge.recordedPrompts()
+	if len(prompts) != 2 {
+		t.Fatalf("prompts = %d, want the parked run's plus one rebuilt from the transcript", len(prompts))
+	}
+	rebuilt := prompts[len(prompts)-1]
+	if !strings.Contains(rebuilt, "Tool result for "+id+": 22C") || !strings.Contains(rebuilt, "Tool result for call_client_minted: 18C") {
+		t.Fatalf("rebuilt prompt missing a tool result:\n%s", rebuilt)
+	}
+}
+
 func TestResumeRequestErrorsDoNotStartAnotherAgent(t *testing.T) {
 	bridge := useFakeBridge(t)
 	bridge.toolRounds = []fakeToolRound{{
@@ -511,7 +596,6 @@ func TestResumeRequestErrorsDoNotStartAnotherAgent(t *testing.T) {
 		apiKey  string
 		results []chatToolResult
 	}{
-		{"partial", "good-key", []chatToolResult{{CallID: id, Content: "x"}, {CallID: "call_missing", Content: "y"}}},
 		{"duplicate", "good-key", []chatToolResult{{CallID: id, Content: "x"}, {CallID: id, Content: "y"}}},
 		{"mixed", "good-key", []chatToolResult{{CallID: id, Content: "x"}, {CallID: other.toolCalls[0].ID, Content: "y"}}},
 		{"wrong-fingerprint", "intruder-key", []chatToolResult{{CallID: id, Content: "x"}}},
