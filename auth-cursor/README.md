@@ -185,6 +185,7 @@ Tools stay off unless the client sends them. The working directory is always emp
 Other limits:
 
 - No token-counting endpoint. `count_tokens` is a character estimate; billing uses counts Cursor reports after a run.
+- Responses carry no `usage`. Cursor counts usage per run, and one run covers every tool round of a client turn, so the total re-counts the turn's context once per round. The run total goes only to the `cursor request completed` log line.
 - `executor.http_request` returns 501.
 - Remote images: only `http`/`https` to a non-loopback, non-private, non-metadata host. Credentials in the URL are refused. The error text never repeats the path or query. The host HTTP client still follows redirects, so a public URL that 302s onto loopback is not blocked here.
 - Region/plan refusals fail that one request without parking the credential. A 401 or 429 that arrives as an `SdkErrorCode` still cools or retires the key.

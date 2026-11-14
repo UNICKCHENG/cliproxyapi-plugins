@@ -52,7 +52,7 @@ func execute(raw []byte) ([]byte, error) {
 	if len(result.toolCalls) > 0 {
 		payload, errBody = buildToolCallCompletion(newCompletionID(), model, result.text, result.toolCalls)
 	} else {
-		payload, errBody = buildCompletion(newCompletionID(), model, result.text, result.usage)
+		payload, errBody = buildCompletion(newCompletionID(), model, result.text)
 	}
 	if errBody != nil {
 		logCtx.failed(errBody.Error())
@@ -125,7 +125,7 @@ func forwardStream(ctx context.Context, streamID, model string, framing streamFr
 			delta.Role = "assistant"
 			roleSent = true
 		}
-		chunk := buildStreamChunk(completionID, model, delta, nil, nil)
+		chunk := buildStreamChunk(completionID, model, delta, nil)
 		return emitPluginStreamChunk(streamID, framing.frame(chunk))
 	}
 
@@ -145,7 +145,7 @@ func forwardStream(ctx context.Context, streamID, model string, framing streamFr
 		return nil
 	}
 	finish := "stop"
-	final := buildStreamChunk(completionID, model, chatCompletionDelta{}, &finish, result.usage)
+	final := buildStreamChunk(completionID, model, chatCompletionDelta{}, &finish)
 	if errEmit := emitPluginStreamChunk(streamID, framing.frame(final)); errEmit != nil {
 		logCtx.failed(errEmit.Error())
 		return errEmit
@@ -168,13 +168,13 @@ func emitToolCallStream(streamID, completionID, model string, framing streamFram
 			delta.Role = "assistant"
 			*roleSent = true
 		}
-		chunk := buildStreamChunk(completionID, model, delta, nil, nil)
+		chunk := buildStreamChunk(completionID, model, delta, nil)
 		if errEmit := emitPluginStreamChunk(streamID, framing.frame(chunk)); errEmit != nil {
 			return errEmit
 		}
 	}
 	finish := "tool_calls"
-	final := buildStreamChunk(completionID, model, chatCompletionDelta{}, &finish, nil)
+	final := buildStreamChunk(completionID, model, chatCompletionDelta{}, &finish)
 	if errEmit := emitPluginStreamChunk(streamID, framing.frame(final)); errEmit != nil {
 		return errEmit
 	}
