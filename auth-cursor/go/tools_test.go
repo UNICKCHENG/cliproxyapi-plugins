@@ -44,6 +44,10 @@ func decodeCompletion(t *testing.T, raw []byte) chatCompletion {
 	if errUnmarshal := json.Unmarshal(env.Result, &response); errUnmarshal != nil {
 		t.Fatalf("decode executor response: %v", errUnmarshal)
 	}
+	// Cursor's usage is per run, and a run spans every tool round, so no reply carries it.
+	if usage := gjson.GetBytes(response.Payload, "usage"); usage.Exists() {
+		t.Fatalf("usage = %s, want none", usage.Raw)
+	}
 	var completion chatCompletion
 	if errUnmarshal := json.Unmarshal(response.Payload, &completion); errUnmarshal != nil {
 		t.Fatalf("decode completion: %v", errUnmarshal)
@@ -259,9 +263,6 @@ func TestExecuteToolCallRoundTrip(t *testing.T) {
 	if finishReason(t, first) != "tool_calls" {
 		t.Fatalf("finish_reason = %q, want tool_calls", finishReason(t, first))
 	}
-	if first.Usage != nil {
-		t.Fatalf("usage = %+v, want none on a tool turn", first.Usage)
-	}
 	if first.Choices[0].Message == nil || len(first.Choices[0].Message.ToolCalls) != 1 {
 		t.Fatalf("tool_calls = %+v", first.Choices[0].Message)
 	}
@@ -297,9 +298,6 @@ func TestExecuteToolCallRoundTrip(t *testing.T) {
 	}
 	if second.Choices[0].Message.Content != "Hello world" {
 		t.Errorf("content = %q, want Hello world", second.Choices[0].Message.Content)
-	}
-	if second.Usage == nil || second.Usage.PromptTokens != 10 || second.Usage.CompletionTokens != 2 {
-		t.Errorf("usage = %+v, want prompt=10 completion=2", second.Usage)
 	}
 	if got := bridge.closedAgents(); len(got) != 1 || got[0] != "agent-1" {
 		t.Errorf("closed agents = %v, want [agent-1]", got)
@@ -632,7 +630,7 @@ func TestBuildStreamChunkEmitsIndexedToolCalls(t *testing.T) {
 				Arguments: `{"city":"Paris"}`,
 			},
 		}},
-	}, &finish, nil)
+	}, &finish)
 	if gjson.GetBytes(chunk, "choices.0.delta.tool_calls.0.index").Int() != 0 {
 		t.Errorf("index omitted: %s", chunk)
 	}

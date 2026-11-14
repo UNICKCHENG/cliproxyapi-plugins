@@ -83,9 +83,9 @@ func TestExecuteAssemblesCompletion(t *testing.T) {
 	if got := completion.Choices[0].Message.Content; got != "Hello world" {
 		t.Errorf("content = %q, want %q", got, "Hello world")
 	}
-	// Cache reads are prompt tokens served from cache, so they belong on the prompt side.
-	if completion.Usage == nil || completion.Usage.PromptTokens != 10 || completion.Usage.CompletionTokens != 2 {
-		t.Errorf("usage = %+v, want prompt=10 completion=2", completion.Usage)
+	// The run's usage total is not this request's usage, so the reply carries none.
+	if usage := gjson.GetBytes(response.Payload, "usage"); usage.Exists() {
+		t.Errorf("usage = %s, want none", usage.Raw)
 	}
 	// A non-streaming request has nothing to do with deltas, so it must not ask for them.
 	if len(bridge.enableDeltas) != 1 || bridge.enableDeltas[0] {
@@ -1047,7 +1047,7 @@ func TestExecuteReportsAnUnfetchableImageAsARequestFault(t *testing.T) {
 
 func TestBuildStreamChunkEmitsBareChunkJSON(t *testing.T) {
 	finish := "stop"
-	chunk := buildStreamChunk("chatcmpl-1", "fake-model", chatCompletionDelta{Content: "Hello"}, &finish, nil)
+	chunk := buildStreamChunk("chatcmpl-1", "fake-model", chatCompletionDelta{Content: "Hello"}, &finish)
 	// The chat-completions SSE writer adds the framing, so the chunk itself must stay bare.
 	if strings.HasPrefix(string(chunk), "data:") {
 		t.Fatalf("chunk carries SSE framing: %q", chunk)

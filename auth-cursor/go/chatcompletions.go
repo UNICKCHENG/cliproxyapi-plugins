@@ -83,7 +83,6 @@ type chatCompletion struct {
 	Created int64                  `json:"created"`
 	Model   string                 `json:"model"`
 	Choices []chatCompletionChoice `json:"choices"`
-	Usage   *chatCompletionUsage   `json:"usage,omitempty"`
 }
 
 func parseChatRequest(payload []byte) (chatRequest, error) {
@@ -381,7 +380,11 @@ func convertUsage(usage *sdkv1.TokenUsage) *chatCompletionUsage {
 	}
 }
 
-func buildCompletion(id, model, text string, usage *sdkv1.TokenUsage) ([]byte, error) {
+// Replies carry no usage. Cursor reports usage once per run, and a run spans every tool
+// round of a client turn, so its total re-counts the whole turn's context on the last
+// reply. Callers that size their context from usage would read that as overflow; without
+// usage they estimate per request instead.
+func buildCompletion(id, model, text string) ([]byte, error) {
 	finish := "stop"
 	return json.Marshal(chatCompletion{
 		ID:      id,
@@ -393,11 +396,10 @@ func buildCompletion(id, model, text string, usage *sdkv1.TokenUsage) ([]byte, e
 			Message:      &chatCompletionMessage{Role: "assistant", Content: text},
 			FinishReason: &finish,
 		}},
-		Usage: convertUsage(usage),
 	})
 }
 
-func buildStreamChunk(id, model string, delta chatCompletionDelta, finishReason *string, usage *sdkv1.TokenUsage) []byte {
+func buildStreamChunk(id, model string, delta chatCompletionDelta, finishReason *string) []byte {
 	chunk := chatCompletion{
 		ID:      id,
 		Object:  "chat.completion.chunk",
@@ -408,7 +410,6 @@ func buildStreamChunk(id, model string, delta chatCompletionDelta, finishReason 
 			Delta:        &delta,
 			FinishReason: finishReason,
 		}},
-		Usage: convertUsage(usage),
 	}
 	raw, errMarshal := json.Marshal(chunk)
 	if errMarshal != nil {
